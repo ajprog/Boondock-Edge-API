@@ -1,7 +1,7 @@
 """Visible route-level authentication and authorization decorators."""
 from functools import wraps
 
-from flask import g, jsonify
+from flask import g, jsonify, request
 
 from ..utils.auth import authenticate
 
@@ -34,7 +34,7 @@ def require_permission(permissions, loader=None, id_argument=None, inject_as=Non
     def decorator(function):
         @wraps(function)
         def decorated_function(*args, **kwargs):
-            failure = authenticate(device_request='device' in permissions)
+            failure = authenticate()
             if failure:
                 return failure
             principal = g.principal
@@ -44,10 +44,13 @@ def require_permission(permissions, loader=None, id_argument=None, inject_as=Non
                 if not available.intersection(permissions):
                     return jsonify({'error': 'Permission required'}), 403
             if loader is not None:
-                resource = (
-                    loader(principal, kwargs.get(id_argument))
-                    if id_argument else loader(principal)
-                )
+                resource = None
+                if id_argument:
+                    argument = kwargs.get(id_argument) or request.values.get(id_argument)
+                    resource = loader(principal, argument, id_argument)
+                else:
+                    resource = loader(principal)
+
                 if resource is None:
                     return jsonify({'error': 'Resource not found'}), 404
                 kwargs[inject_as] = resource

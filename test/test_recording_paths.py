@@ -11,12 +11,13 @@ def test_get_recording_path_preserves_uploaded_filename(tmp_path, monkeypatch):
         "AABBCCDDEEFF", recorded_at, "device-recording.wav"
     )
 
-    assert absolute_path == tmp_path / "recordings/aabbccddeeff/2026/08/28/device-recording.wav"
+    assert (
+        absolute_path
+        == tmp_path / "recordings/aabbccddeeff/2026/08/28/device-recording.wav"
+    )
 
 
-def test_get_recording_path_appends_microseconds_for_duplicate(
-    tmp_path, monkeypatch
-):
+def test_get_recording_path_appends_microseconds_for_duplicate(tmp_path, monkeypatch):
     monkeypatch.setattr(route_utils, "DATA_ROOT", tmp_path)
     recorded_at = datetime(2026, 8, 28, 12, 34, 56, tzinfo=timezone.utc)
     original = (

@@ -6,7 +6,6 @@ import json
 import os
 import re
 import logging
-import sqlite3
 import subprocess
 import io
 import time
@@ -15,7 +14,7 @@ from config import DATA_ROOT
 from datetime import datetime, timezone
 from flask import Blueprint, after_this_request, jsonify, request, send_file
 from flasgger import swag_from
-from ..middleware.auth_middleware import require_admin, require_auth, require_permission
+from ..middleware.auth_middleware import require_admin, require_permission
 from tempfile import NamedTemporaryFile
 from urllib.parse import urlencode
 from werkzeug.utils import secure_filename
@@ -28,6 +27,8 @@ from app.services.channel_state import (
     get_channel_visual_state,
     get_stored_visual_state,
     get_all_channel_visual_states,
+    load_owned_channels,
+    load_request_channel,
     touch_device_activity,
     ChannelVisualState,
 )
@@ -56,7 +57,7 @@ from ..routes.route_utils import (
     calculate_wav_duration,
     allowed_file,
 )
-from ..services.settings_manager import get_settings_manager, normalize_mac_address
+from ..services.settings_manager import normalize_mac_address
 from ..services.device_health_monitor import (
     track_device_created,
     track_connection,
@@ -70,357 +71,19 @@ from ..services.cloud_device_events import (
     list_cloud_events_for_mac,
 )
 
-_settings_manager = get_settings_manager()
-
 device_bp = Blueprint('device', __name__)
 
 # Directory for device settings storage
 DEVICE_SETTINGS_DIR = str(DATA_ROOT / 'device_settings')
 os.makedirs(DEVICE_SETTINGS_DIR, exist_ok=True)
 
-# Event code mapping
-EVENT_CODE_MAPPING = {
-    'I01': 'Starting in normal mode',
-    'I02': 'Boondock ready and listening',
-    'I03': '',
-    'I04': 'Config updated',
-    'I05': 'Speaker mute',
-    'I06': 'Speaker unmute',
-    'I07': 'Recording active',
-    'I08': 'Recording inactive',
-    'I09': 'PTT activated',
-    'I10': 'PTT Released',
-    'I11': 'PTT recording active',
-    'I12': 'PTT recording inactive',
-    'I13': 'Playing System Audio',
-    'I14': 'SD Card usage',
-    'I15': 'Tx is enabled',
-    'I16': 'Tx is disabled',
-    'I17': 'Line in minimum db changed',
-    'I18': 'Line in gain chagned',
-    'I19': 'Play system audio queued',
-    'I20': 'Play audio queued',
-    'I21': 'Transmit audio file queued',
-    'I22': 'Min recording size updated',
-    'I23': 'Silence duration udpated',
-    'I24': 'Max recording size updated',
-    'I25': 'Speaker volume changed to',
-    'I26': 'User ID changed to',
-    'I27': 'Dock name changed to',
-    'I28': 'Playback volume changed',
-    'I29': 'OTA update changed to',
-    'I30': 'TX volume changed to',
-    'I31': 'Start remote recording',
-    'I32': 'Stop remote recording',
-    'I33': 'Remote Reboot',
-    'I34': 'Save Config',
-    'I35': 'Factory Reset',
-    'I36': 'Set default settings',
-    'I37': 'Audio file uploaded',
-    'I38': 'Upgrading config file',
-    'I39': 'Reboot reason',
-    'I40': '',
-    'I41': 'Upload response',
-    'I42': 'Playback complete',
-    'I43': 'Transmit complete',
-    'I44': 'Transmit is not allowed',
-    'I45': 'Load cdn files',
-    'I46': 'Downloading for playback',
-    'I47': 'Adding playback queue',
-    'I48': 'Upload complete',
-    'I49': '',
-    'I50': 'Completed downloading audio',
-    'I51': 'Recording upload active',
-    'I52': 'Recording upload inactive',
-    'I53': 'Start remote Mic recording',
-    'I54': 'Stop remote Mic recording',
-    'I55': 'PTT upload active',
-    'I56': 'PTT upload inactive',
-    'I57': 'Notify All Settings',
-    'I58': 'Downlaod audio cache',
-    'I59': 'Cache and Play',
-    'I60': '',
-    'I61': '',
-    'I62': '',
-    'I63': 'Audio recording complete',
-    'I64': 'Uploading Audio file',
-    'I65': 'Audio uploaded successfully',
-    'E41': 'Software Reset',
-    'E01': 'Unknown error',
-    'E02': 'Invalid parameters',
-    'E03': 'Duplicate file',
-    'E04': 'File too big',
-    'E05': 'Empty file',
-    'E06': 'File too small',
-    'E07': 'Server error when saving file',
-    'E08': 'Error moving file',
-    'E09': 'Error updating database',
-    'E10': 'Error creating directory',
-    'BI01': 'Starting Boondock Echo',
-    'BI02': 'Online',
-    'BI03': 'Firmware update requested',
-    'BI04': 'Restarting',
-    'BI05': 'Updating firmware',
-    'BI06': 'Saving configurations',
-    'BI07': 'Recording is enabled',
-    'BI08': 'Recording is disabled',
-    'BI09': 'You have new messages',
-    'BI10': 'No more new messages',
-    'BI11': 'Begin message playback',
-    'BI12': 'End message playback',
-    'BI13': 'Being transmit message',
-    'BI14': 'End transmit message',
-    'BI15': 'Recording start',
-    'BI16': 'Recording end',
-    'BI17': 'Mute speaker',
-    'BI18': 'Unmute speaker',
-    'BI19': '',
-    'BI20': 'Registration information updated',
-    'BI21': 'Factory reset',
-    'BI22': 'Device name updated',
-    'BI23': '',
-    'BI24': 'PTT is enabled',
-    'BI25': 'PTT is disabled',
-    'BI26': 'Speaker volume updated',
-    'BI27': 'PTT volume updated',
-    'BI28': 'Alert volume updated',
-    'BI29': 'Timezone updated',
-    'BI30': 'Daylight saving updated',
-    'BI31': 'License updated',
-    'BI32': 'Audio notifications enabled',
-    'BI33': 'Audio notifications disabled',
-    'BI34': 'Live update enabled',
-    'BI35': 'Input gain updated',
-    'BI36': 'Min recording updated',
-    'BI37': 'Max recording updated',
-    'BI38': 'Silence updated',
-    'BI39': 'Recorder threshold updated',
-    'BI40': 'WiFi SSID and password updated',
-    'BI41': 'Static IP setting updated',
-    'BI42': 'Static IP updated',
-    'BI43': 'Static gateway updated',
-    'BI44': 'Primary DNS updated',
-    'BI45': 'Secondary DNS updated',
-    'BI46': 'SD card',
-    'BI47': 'Auto-deleting audio files',
-    'BI48': '',
-    'BI49': '',
-    'BI50': 'Input audio level low',
-    'BI51': 'Input audio level high',
-    'E800': 'Unknown error',
-    'E801': 'No error',
-    'E802': 'SD card mount failed',
-    'E803': 'No SD card present',
-    'E804': 'SD card not formatted',
-    'E805': 'Read/Write permission error',
-    'E806': 'Unknown SD card error',
-    'E807': 'Disk too small',
-    'E808': 'Disk too large',
-    'E809': 'Invalid file system',
-    'E810': 'WiFi connection failed',
-    'E811': 'No SSID available',
-    'E812': 'WiFi connection lost',
-    'E813': 'WiFi disconnected',
-    'E814': 'WiFi idle status',
-    'E815': 'DNS error',
-    'E816': 'SSID missing',
-    'E817': 'SSID too long',
-    'E818': 'Undefined error E017',
-    'E819': 'DNS error when uploading',
-    'E820': 'SD card initialization failed',
-    'E821': 'HTTP initialization failed',
-    'E822': 'HTTP operation failed',
-    'E823': 'Not enough space',
-    'E824': 'Failed to open file',
-    'E825': 'Incomplete file',
-    'E826': 'SD card unavailable',
-    'E827': 'File open failed',
-    'E828': 'File rename failed',
-    'E829': 'File read failed',
-    'E830': 'File write failed',
-    'E831': 'File delete failed',
-    'E832': 'File not found',
-    'E833': 'Directory creation failed',
-    'E834': 'I2S initialization failed',
-    'E835': 'Audio playback failed',
-    'E836': 'Audio buffer overflow',
-    'E837': 'Audio codec initialization failed',
-    'E838': 'Server connection failed',
-    'E839': 'Audio upload failed',
-    'E840': 'Invalid server response',
-    'E841': 'MQTT connection failed',
-    'E842': 'MQTT subscription failed',
-    'E843': 'MQTT publish failed',
-    'E844': 'Invalid MQTT message',
-    'E845': 'Firmware download failed',
-    'E846': 'Firmware verification failed',
-    'E847': 'Firmware installation failed',
-    'E848': 'OTA begin failed',
-    'E849': 'OTA write failed',
-    'E850': 'OTA end failed',
-    'E851': 'Low heap memory',
-    'E852': 'Stack overflow',
-    'E853': 'Speaker initialization failed',
-    'E854': 'Microphone initialization failed',
-    'E855': 'Task creation failed',
-    'E856': 'Watchdog timeout',
-    'E857': 'System reset',
-    'E858': 'Error setting mDNS host',
-    'E859': 'Error setting date/time',
-    'E860': 'LED initialization failed',
-    'E861': 'Keypad initialization failed',
-    'E862': 'SD initialization failed',
-    'E863': 'SD card full',
-    'E864': 'SD write error',
-    'E865': 'Configuration initialization error',
-    'E866': 'Corrupted configuration',
-    'E867': 'I2C initialization failed',
-    'E868': 'I2S initialization failed',
-    'E869': 'Fatal audio kit error',
-    'E870': 'WiFi credentials missing',
-    'E871': 'Unknown WiFi error',
-    'E872': 'WiFi network unreachable',
-    'E873': 'WiFi login failed',
-    'E874': 'Poor WiFi signal',
-    'E875': 'DNS resolution failed',
-    'E876': 'DHCP configuration failed',
-    'E877': 'Unknown network error',
-    'E878': 'Boondock MQTT initialization failed',
-    'E879': 'Boondock server initialization failed',
-    'E880': 'Clock initialization failed',
-    'E881': 'Main loop initialization failed',
-    'E882': 'Audio system check failed',
-    'V100': 'Unknown event',
-    'V101': 'Starting Boondock',
-    'V102': 'Initialization OK',
-    'V103': 'Audio uploaded',
-    'V104': 'Download Firmware',
-    'V105': 'Update Firmware',
-    'V106': 'Unused V006',
-    'V107': 'Recording active',
-    'V108': 'Recording inactive',
-    'V109': 'SD card usage',
-    'V110': 'User ID changed',
-    'V111': 'Dock name changed',
-    'V112': 'Remote reboot',
-    'V113': 'Unused V013',
-    'V114': 'Factory reset',
-    'V115': 'Set default settings',
-    'V116': 'Unused V016',
-    'V117': 'Unused V017',
-    'V118': 'Unused V018',
-    'V119': 'Online',
-    'V120': 'Restarting',
-    'V121': 'Updating firmware',
-    'V122': 'Saving configurations',
-    'V123': 'Begin message playback',
-    'V124': 'Begin transmit message',
-    'V125': 'Registration info updated',
-    'V126': 'License updated',
-    'V127': 'Auto deleting audio files',
-    'I400': 'Unknown info',
-    'I401': 'Speaker mute',
-    'I402': 'Speaker unmute',
-    'I403': 'PTT activated',
-    'I404': 'PTT released',
-    'I405': 'PTT recording active',
-    'I406': 'PTT recording inactive',
-    'I407': 'Playing system audio',
-    'I408': 'TX enabled',
-    'I409': 'TX disabled',
-    'I410': 'Line in minimum dB changed',
-    'I411': 'Line in gain changed',
-    'I412': 'Play system audio queued',
-    'I413': 'Play audio queued',
-    'I414': 'Transmit audio queued',
-    'I415': 'Min recording size updated',
-    'I416': 'Silence duration updated',
-    'I417': 'Max recording size updated',
-    'I418': 'Speaker volume changed',
-    'I419': 'Playback volume changed',
-    'I420': 'OTA update changed',
-    'I421': 'TX volume changed',
-    'I422': 'Start remote recording',
-    'I423': 'Stop remote recording',
-    'I424': 'Upgrading config file',
-    'I425': 'Reboot reason',
-    'I426': 'Upload response',
-    'I427': 'Playback complete',
-    'I428': 'Transmit complete',
-    'I429': 'Transmit not allowed',
-    'I430': 'Load CDN files',
-    'I431': 'Downloading for playback',
-    'I432': 'Adding playback queue',
-    'I433': 'Upload complete',
-    'I434': 'Completed downloading audio',
-    'I435': 'Recording upload active',
-    'I436': 'Recording upload inactive',
-    'I437': 'Start remote mic recording',
-    'I438': 'Stop remote mic recording',
-    'I439': 'PTT upload active',
-    'I440': 'PTT upload inactive',
-    'I441': 'Notify all settings',
-    'I442': 'Download audio cache',
-    'I443': 'Cache and play',
-    'I444': 'Audio recording complete',
-    'I445': 'Uploading audio file',
-    'I446': 'Audio uploaded successfully',
-    'I447': 'Unknown error',
-    'I448': 'Invalid parameters',
-    'I449': 'Duplicate file',
-    'I450': 'File too big',
-    'I451': 'Empty file',
-    'I452': 'File too small',
-    'I453': 'Server error saving file',
-    'I454': 'Error moving file',
-    'I455': 'Error updating database',
-    'I456': 'Error creating directory',
-    'I457': 'Firmware update requested',
-    'I458': 'Recording enabled',
-    'I459': 'Recording disabled',
-    'I460': 'New messages',
-    'I461': 'No more new messages',
-    'I462': 'End message playback',
-    'I463': 'End transmit message',
-    'I464': 'Recording start',
-    'I465': 'Recording end',
-    'I466': 'Mute speaker',
-    'I467': 'Unmute speaker',
-    'I468': 'Factory reset',
-    'I469': 'Device name updated',
-    'I470': 'PTT enabled',
-    'I471': 'PTT disabled',
-    'I472': 'Speaker volume updated',
-    'I473': 'PTT volume updated',
-    'I474': 'Alert volume updated',
-    'I475': 'Timezone updated',
-    'I476': 'Daylight saving updated',
-    'I477': 'Audio notifications enabled',
-    'I478': 'Audio notifications disabled',
-    'I479': 'Live update enabled',
-    'I480': 'Input gain updated',
-    'I481': 'Min recording updated',
-    'I482': 'Max recording updated',
-    'I483': 'Silence updated',
-    'I484': 'Recorder threshold updated',
-    'I485': 'WiFi SSID and password updated',
-    'I486': 'Static IP setting updated',
-    'I487': 'Static IP updated',
-    'I488': 'Static gateway updated',
-    'I489': 'Primary DNS updated',
-    'I490': 'Secondary DNS updated',
-    'I491': 'SD card',
-    'I492': 'Input audio level low',
-    'I493': 'Input audio level high',
-    'I494': 'Online',
-}
-
+def _device_logs_root(mac_key: str) -> str:
+    return DATA_ROOT / "logs" / mac_key.lower()
 
 def _mac_hex_only(mac_str):
     if not mac_str:
         return ""
     return re.sub(r"[^0-9A-Fa-f]", "", str(mac_str).strip()).upper()
-
 
 def _normalize_cloud_mac_address(mac_str):
     """Return AA:BB:CC:DD:EE:FF or None if invalid."""
@@ -429,509 +92,145 @@ def _normalize_cloud_mac_address(mac_str):
         return None
     return ":".join(hx[i : i + 2] for i in range(0, 12, 2))
 
-def _with_device_bootstrap_token(result, mac_address):
-    """Attach a device credential to a successful event response when needed."""
-    response, status = result
-    if status >= 400:
-        return result
-
-    normalized_mac = _normalize_cloud_mac_address(mac_address)
-    token = get_request_token()
-    token_mac = (
-        get_mac_for_token(token, expected_mac=normalized_mac)
-        if token and normalized_mac else None
-    )
-    if token_mac:
-        return result
-
-    issued_token, expires_at = generate_token(normalized_mac)
-    if not issued_token:
-        return jsonify({"error": "Failed to issue device token"}), 500
-
-    body = response.get_json() or {}
-    body["token"] = issued_token
-    body["expires_at"] = expires_at
-    response = jsonify(body)
-    response.headers["Cache-Control"] = "no-store"
-    return response, status
-
-def _handle_cloud_style_device_event(data):
-    """Cloud API: JSON body mac_address, event_type, optional event_data (DEVICE_API.md)."""
-    mac_colon = _normalize_cloud_mac_address(data.get("mac_address") or "")
-    if not mac_colon:
-        return jsonify({"error": "Missing required fields"}), 400
-
-    event_type = (data.get("event_type") or "").strip()
-    if not event_type:
-        return jsonify({"error": "Missing required fields"}), 400
-
-    event_type_id = cloud_event_type_id(event_type)
-    event_data = data.get("event_data")
-    if event_data is not None and not isinstance(event_data, dict):
-        event_data = {"value": event_data}
-
-    mac_key = normalize_mac_address(mac_colon)
-    if len(mac_key) != 12:
-        return jsonify({"error": "Invalid MAC address"}), 400
-    if get_channel_id_from_mac(mac_key, refresh=False) is None:
-        new_id = create_channel_for_mac(mac_key)
-        if new_id is None:
-            return jsonify({"error": "Failed to create channel"}), 500
-        track_device_created(mac_key)
-
-    # Use the unified token transport parser here as well.  The previous local
-    # parser accepted only an exact ``Authorization: Bearer `` prefix, so a
-    # valid device credential sent through X-API-Key (or a case-variant bearer
-    # scheme) was treated as missing and a replacement credential was issued.
-    token = get_request_token()
-    warning = None
-    new_token = None
-    expires_at = None
-
-    if not is_mac_registered(mac_colon):
-        new_token, expires_at = generate_token(mac_colon)
-        warning = "MAC address registered"
-
-    # Always perform the diagnostic lookup.  Besides validating a presented
-    # credential, this records an explicit ``missing`` result before bootstrap
-    # issues a credential when the device did not send one.
-    token_mac = get_mac_for_token(token, expected_mac=mac_colon)
-    token_hex = _mac_hex_only(token_mac) if token_mac else ""
-    token_valid = bool(
-        token_hex
-        and token_hex == _mac_hex_only(mac_colon)
-        and authenticate_token(token)
-    )
-    if not token_valid:
-        if not new_token:
-            new_token, expires_at = generate_token(mac_colon)
-        warning = "Invalid token" if not warning else warning + "; Invalid token"
-
-    persist_cloud_device_event_async(
-        mac_key, event_type_id, event_type, event_data
-    )
-
-    touch_device_activity(mac_key)
-
-    et = event_type.strip().lower()
-    if et == "online":
-        track_connection(mac_key)
-        track_event(mac_key)
-        set_channel_visual_state(mac_key, "online")
-    elif et == "ping":
-        track_connection(mac_key)
-        track_event(mac_key)
-        if get_stored_visual_state(mac_key) != ChannelVisualState.RECORDING:
-            set_channel_visual_state(mac_key, "online")
-    elif et == "record_begin":
-        track_event(mac_key)
-        set_channel_visual_state(mac_key, ChannelVisualState.RECORDING)
-    elif et == "record_end":
-        track_event(mac_key)
-        set_channel_visual_state(mac_key, ChannelVisualState.IDLE)
-    elif et == "warning":
-        track_event(mac_key)
-        set_channel_visual_state(mac_key, ChannelVisualState.WARNING)
-    elif et in ("error", "fatal_error"):
-        track_event(mac_key)
-        track_error(mac_key)
-        set_channel_visual_state(mac_key, ChannelVisualState.ERROR)
-    else:
-        track_event(mac_key)
-
-    ts = datetime.now(timezone.utc).isoformat()
-    body = {"message": "Event received", "timestamp": ts}
-    if warning:
-        body["warning"] = warning
-    if new_token:
-        body["token"] = new_token
-        body["expires_at"] = expires_at
-    return jsonify(body), 200
-
-
-@device_bp.route('/event', methods=['POST'])
-@swag_from({
-    'tags': ['Events'],
-    'summary': 'Handle device event (legacy endpoint)',
-    'description': 'Legacy endpoint for device events. Use /api/v1/events instead.',
-    'parameters': [
-        {
-            'name': 'mac',
-            'in': 'query',
-            'type': 'string',
-            'required': True,
-            'description': 'MAC address'
-        },
-        {
-            'name': 'body',
-            'in': 'body',
-            'required': False,
-            'schema': {
-                'type': 'object',
-                'description': 'Optional event data',
-                'example': {
-                    'tag': 'john'
-                }
-            }
-        }
-    ],
-    'responses': {
-        '200': {'description': 'Event processed successfully'},
-        '201': {'description': 'New channel created'},
-        '400': {'description': 'Bad request'},
-        '500': {'description': 'Server error'}
-    }
-})
-def handle_event_legacy():
-    """Legacy endpoint for device events. Same as POST /api/v1/events?mac=…"""
-    return _handle_legacy_events_post()
-
-
 @device_bp.route('/v1/events', methods=['POST'])
 @swag_from({
     'tags': ['Events'],
-    'summary': 'Handle device event (legacy ?mac= or cloud JSON body)',
+    'summary': 'Handle a device lifecycle event',
     'description': (
-        'Legacy Edge: POST with query mac= and optional JSON for channel updates. '
-        'Cloud-style: POST application/json with mac_address, event_type, optional event_data.'
+        'Accepts a JSON device event with mac_address, event_type, and optional '
+        'event_data.'
     ),
     'parameters': [
         {
-            'name': 'mac',
-            'in': 'query',
-            'type': 'string',
-            'required': False,
-            'description': 'MAC address (legacy Edge firmware)',
-        },
-        {
             'name': 'body',
             'in': 'body',
-            'required': False,
+            'required': True,
             'schema': {
-                'oneOf': [
-                    {
-                        'type': 'object',
-                        'description': 'Legacy optional channel fields',
-                        'example': {'tag': 'john'},
-                    },
-                    {
-                        'type': 'object',
-                        'required': ['mac_address', 'event_type'],
-                        'properties': {
-                            'mac_address': {'type': 'string'},
-                            'event_type': {'type': 'string'},
-                            'event_data': {'type': 'object'},
-                        },
-                    },
-                ],
+                'type': 'object',
+                'required': ['mac_address', 'event_type'],
+                'properties': {
+                    'mac_address': {'type': 'string'},
+                    'event_type': {'type': 'string'},
+                    'event_data': {'type': 'object'},
+                },
             },
         },
     ],
     'responses': {
-        '200': {'description': 'OK — channel or cloud event'},
-        '201': {'description': 'New channel created (legacy)'},
-        '400': {'description': 'Bad request'},
+        '200': {'description': 'Event accepted'},
+        '400': {'description': 'Missing or invalid fields'},
         '500': {'description': 'Server error'},
     },
 })
 def post_v1_events():
-    """Dispatch legacy Edge (?mac=) vs cloud-style JSON lifecycle events."""
-    if request.args.get("mac"):
-        return _with_device_bootstrap_token(
-            _handle_legacy_events_post(), request.args.get("mac")
-        )
+    """Accept a JSON device lifecycle event."""
     data = request.get_json(silent=True)
-    if isinstance(data, dict):
-        ma = (data.get("mac_address") or "").strip()
-        et = (data.get("event_type") or "").strip()
-        if ma and et:
-            try:
-                return _handle_cloud_style_device_event(data)
-            except Exception:
-                logging.exception("cloud-style device event")
-                return (
-                    jsonify(
-                        {"error": "An error occurred processing your request"}
-                    ),
-                    500,
-                )
-        if len(data) > 0:
-            return jsonify({"error": "Missing required fields"}), 400
-    if request.data:
-        return jsonify({"error": "Missing required fields"}), 400
-    return (
-        jsonify({"error": "MAC address is required in query parameters"}),
-        400,
-    )
-
-
-def _handle_legacy_events_post():
-    """Handle device events and manage channel configuration (Edge ?mac=)."""
+    if not isinstance(data, dict):
+        return jsonify({'error': 'JSON body is required'}), 400
+    if not (data.get('mac_address') or '').strip() or not (
+        data.get('event_type') or ''
+    ).strip():
+        return jsonify({'error': 'Missing required fields'}), 400
     try:
-        # Extract MAC address from query parameters
-        mac = request.args.get('mac')
-        if not mac:
-          # error_logger.error("MAC address is missing in query parameters.")
-            return jsonify({'error': 'MAC address is required in query parameters'}), 400
+        """Cloud API: JSON body mac_address, event_type, optional event_data (DEVICE_API.md)."""
+        mac_colon = _normalize_cloud_mac_address(data.get("mac_address") or "")
+        if not mac_colon:
+            return jsonify({"error": "Missing required fields"}), 400
 
-        mac = mac.upper()
+        event_type = (data.get("event_type") or "").strip()
+        if not event_type:
+            return jsonify({"error": "Missing required fields"}), 400
 
-        # Parse JSON body (optional)
-        data = request.get_json(silent=True)
+        event_type_id = cloud_event_type_id(event_type)
+        event_data = data.get("event_data")
+        if event_data is not None and not isinstance(event_data, dict):
+            event_data = {"value": event_data}
 
-        # Check if channel exists by querying database directly
-        existing_channel_id = get_channel_id_from_mac(mac, refresh=False)
-        existing_channel = None
-        if existing_channel_id:
-            existing_channel = _settings_manager.get_channel(existing_channel_id)
-        
-        # Default channel attributes
-        default_channel = {
-            "id": None,
-            "mac": mac,
-            "name": None,
-            "status": "enabled",
-            "model": "tiny.en",
-            "src_language": "english",
-            "threshold": "50",
-            "silence": "1000",
-            "min_rec": "1000",
-            "max_rec": "30000",
-            "audio_gain": "3",
-            "color": "#000000",
-            "background_color": "#ffffff",
-            "team_color": "#b54f4f",
-            "target_language": "english",
-            "driver": "driver name",
-            "person": "person name",
-            "tag": "tag",
-            "car": "car name",
-            "audio_stream_enabled": False,
-            "speaker_enabled": False,
-            "speaker_volume": 50,
-            "state": "resume"
-        }
+        mac_key = normalize_mac_address(mac_colon)
+        if len(mac_key) != 12:
+            return jsonify({"error": "Invalid MAC address"}), 400
+        if get_channel_id_from_mac(mac_key, refresh=False) is None:
+            new_id = create_channel_for_mac(mac_key)
+            if new_id is None:
+                return jsonify({"error": "Failed to create channel"}), 500
+            track_device_created(mac_key)
 
-        # If no JSON body is provided (ping request)
-        if data is None:
-            # Track connection
-            track_connection(mac)
-            
-            if existing_channel:
-                event_logger.info(f"Ping received for MAC: {mac}. Returning latest channel data.")
-                response_data = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "message": "Channel exists",
-                    "channel": {
-                        "state": "stop" if existing_channel.get("status") == "disabled" else existing_channel.get("state", "resume"),
-                        "threshold": existing_channel.get("threshold"),
-                        "silence": existing_channel.get("silence"),
-                        "min_rec": existing_channel.get("min_rec"),
-                        "max_rec": existing_channel.get("max_rec"),
-                        "audio_gain": existing_channel.get("audio_gain"),
-                        "stream": 1 if existing_channel.get("audio_stream_enabled", False) else 0,
-                        "speaker": existing_channel.get("speaker_enabled", False),
-                        "volume": existing_channel.get("speaker_volume", 50),
-                    }
-                }
-                if existing_channel.get("audio_stream_enabled") and existing_channel.get("audio_stream_port"):
-                    response_data["channel"]["port"] = existing_channel.get("audio_stream_port")
-                return jsonify(response_data), 200
-            else:
-                # Create a new channel if none exists - call OUTSIDE the lock to avoid deadlock
-                new_channel_id = create_channel_for_mac(mac)
-                if new_channel_id is None:
-                    error_logger.error(f"Failed to create channel for MAC: {mac} in event handler")
-                    return jsonify({"error": "Failed to create channel"}), 500
-                
-                # Track device creation
-                track_device_created(mac)
-                
-                # Get the newly created channel from database
-                existing_channel = _settings_manager.get_channel(new_channel_id)
-                if not existing_channel:
-                    error_logger.error(f"Channel {new_channel_id} was created but not found in database")
-                    return jsonify({"error": "Channel creation failed"}), 500
-                
-                event_logger.info(f"Ping received for MAC: {mac}. No channel found, created new channel: {new_channel_id}")
-                response_data = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "message": "New channel created due to ping request",
-                    "channel": {
-                        "state": existing_channel.get("state", "resume"),
-                        "threshold": existing_channel.get("threshold", "50"),
-                        "silence": existing_channel.get("silence", "1000"),
-                        "min_rec": existing_channel.get("min_rec", "1000"),
-                        "max_rec": existing_channel.get("max_rec", "30000"),
-                        "audio_gain": existing_channel.get("audio_gain", "3"),
-                        "stream": 1 if existing_channel.get("audio_stream_enabled", False) else 0,
-                        "speaker": existing_channel.get("speaker_enabled", False),
-                        "volume": existing_channel.get("speaker_volume", 50),
-                    }
-                }
-                if existing_channel.get("audio_stream_enabled") and existing_channel.get("audio_stream_port"):
-                    response_data["channel"]["port"] = existing_channel.get("audio_stream_port")
-                return jsonify(response_data), 201
+        # Use the unified token transport parser here as well.  The previous local
+        # parser accepted only an exact ``Authorization: Bearer `` prefix, so a
+        # valid device credential sent through X-API-Key (or a case-variant bearer
+        # scheme) was treated as missing and a replacement credential was issued.
+        token = get_request_token()
+        warning = None
+        new_token = None
+        expires_at = None
 
-        # If JSON body is provided and channel exists, update only if changes are needed
-        if existing_channel:
-                # Track connection and event
-                track_connection(mac)
-                track_event(mac)
-                
-                # Check for visual state event_code first (before persisting to channels.json)
-                event_code = data.get('event_code')
-                if event_code:
-                    # Track errors if event code starts with 'E'
-                    if event_code.startswith('E'):
-                        track_error(mac)
-                    
-                    # Map event codes to visual states
-                    if event_code in ['I07', 'I11', 'I51', 'I55', 'I63', 'I64', 'I65']:
-                        # Recording/upload related events = recording state
-                        set_channel_visual_state(mac, ChannelVisualState.RECORDING)
-                    elif event_code in ['I08', 'I12', 'I52', 'I56']:
-                        # Idle/inactive events = idle state
-                        set_channel_visual_state(mac, ChannelVisualState.IDLE)
-                    elif event_code.startswith('E'):
-                        # Error events (E01-E10, etc) = error state
-                        set_channel_visual_state(mac, ChannelVisualState.ERROR)
-                    elif event_code in ['I05', 'I06', 'I15', 'I16']:
-                        # Warning-type events = warning state
-                        set_channel_visual_state(mac, ChannelVisualState.WARNING)
-                    
-                    event_logger.debug(f"Set visual state for MAC {mac} based on event_code {event_code}")
-                
-                # Check for changes
-                changes_needed = False
-                updated_fields = {}
-                for key, value in data.items():
-                    if key in existing_channel and existing_channel[key] != value:
-                        changes_needed = True
-                        updated_fields[key] = value
+        if not is_mac_registered(mac_colon):
+            new_token, expires_at = generate_token(mac_colon)
+            warning = "MAC address registered"
 
-                if changes_needed:
-                    # Update existing channel with provided data
-                    existing_channel.update(updated_fields)
-                    # Save updates using SettingsManager
-                    _settings_manager.save_channel(existing_channel)
+        # Always perform the diagnostic lookup.  Besides validating a presented
+        # credential, this records an explicit ``missing`` result before bootstrap
+        # issues a credential when the device did not send one.
+        token_mac = get_mac_for_token(token, expected_mac=mac_colon)
+        token_hex = _mac_hex_only(token_mac) if token_mac else ""
+        token_valid = bool(
+            token_hex
+            and token_hex == _mac_hex_only(mac_colon)
+            and authenticate_token(token)
+        )
+        if not token_valid:
+            if not new_token:
+                new_token, expires_at = generate_token(mac_colon)
+            warning = "Invalid token" if not warning else warning + "; Invalid token"
 
-                    event_logger.info(f"Updated channel for MAC: {mac}. Changes: {updated_fields}")
-                else:
-                    event_logger.debug(f"No changes needed for MAC: {mac}. Current data matches: {data}")
+        persist_cloud_device_event_async(
+            mac_key, event_type_id, event_type, event_data
+        )
 
-                response_data = {
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "message": "Channel processed successfully" if changes_needed else "No update needed",
-                    "channel": {
-                        "state": "stop" if existing_channel.get("status") == "disabled" else existing_channel.get("state", "resume"),
-                        "threshold": existing_channel.get("threshold"),
-                        "silence": existing_channel.get("silence"),
-                        "min_rec": existing_channel.get("min_rec"),
-                        "max_rec": existing_channel.get("max_rec"),
-                        "audio_gain": existing_channel.get("audio_gain"),
-                        "stream": 1 if existing_channel.get("audio_stream_enabled", False) else 0,
-                        "speaker": existing_channel.get("speaker_enabled", False),
-                        "volume": existing_channel.get("speaker_volume", 50),
-                    }
-                }
-                if existing_channel.get("audio_stream_enabled") and existing_channel.get("audio_stream_port"):
-                    response_data["channel"]["port"] = existing_channel.get("audio_stream_port")
-                return jsonify(response_data), 200
+        touch_device_activity(mac_key)
+
+        et = event_type.strip().lower()
+        if et == "online":
+            track_connection(mac_key)
+            track_event(mac_key)
+            set_channel_visual_state(mac_key, "online")
+        elif et == "ping":
+            track_connection(mac_key)
+            track_event(mac_key)
+            if get_stored_visual_state(mac_key) != ChannelVisualState.RECORDING:
+                set_channel_visual_state(mac_key, "online")
+        elif et == "record_begin":
+            track_event(mac_key)
+            set_channel_visual_state(mac_key, ChannelVisualState.RECORDING)
+        elif et == "record_end":
+            track_event(mac_key)
+            set_channel_visual_state(mac_key, ChannelVisualState.IDLE)
+        elif et == "warning":
+            track_event(mac_key)
+            set_channel_visual_state(mac_key, ChannelVisualState.WARNING)
+        elif et in ("error", "fatal_error"):
+            track_event(mac_key)
+            track_error(mac_key)
+            set_channel_visual_state(mac_key, ChannelVisualState.ERROR)
         else:
-            # If MAC is new and JSON body is provided, create a new channel using the standard function
-            new_channel_id = create_channel_for_mac(mac)
-        if new_channel_id is None:
-            error_logger.error(f"Failed to create channel for MAC: {mac} in event handler")
-            return jsonify({"error": "Failed to create channel"}), 500
-        
-        # Track device creation, connection, and event
-        track_device_created(mac)
-        track_connection(mac)
-        track_event(mac)
-        
-        # Check for error events
-        event_code = data.get('event_code') if data else None
-        if event_code and event_code.startswith('E'):
-            track_error(mac)
-        
-        # Get the newly created channel from database
-        existing_channel = _settings_manager.get_channel(new_channel_id)
-        if not existing_channel:
-            error_logger.error(f"Channel {new_channel_id} was created but not found in database")
-            return jsonify({"error": "Channel creation failed"}), 500
-        
-        # Update the channel with any additional data from the request
-        if data:
-            existing_channel.update(data)
-            _settings_manager.save_channel(existing_channel)
-        
-        event_logger.info(f"New channel added for MAC: {mac}. Channel ID: {new_channel_id}")
-        response_data = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "message": "New channel added successfully",
-            "channel": {
-                "state": existing_channel.get("state", "resume"),
-                "threshold": existing_channel.get("threshold", "50"),
-                "silence": existing_channel.get("silence", "1000"),
-                "min_rec": existing_channel.get("min_rec", "1000"),
-                "max_rec": existing_channel.get("max_rec", "30000"),
-                "audio_gain": existing_channel.get("audio_gain", "3"),
-                "stream": 1 if existing_channel.get("audio_stream_enabled", False) else 0,
-                "speaker": existing_channel.get("speaker_enabled", False),
-                "volume": existing_channel.get("speaker_volume", 50),
-            }
-        }
-        if existing_channel.get("audio_stream_enabled") and existing_channel.get("audio_stream_port"):
-            response_data["channel"]["port"] = existing_channel.get("audio_stream_port")
-        return jsonify(response_data), 201
+            track_event(mac_key)
 
-    except Exception as e:
-        error_logger.error(f"Error in handle_event: {str(e)}")
-        # Track error if we have a MAC address
-        mac = request.args.get('mac')
-        if mac:
-            track_error(mac.upper())
-        return jsonify({"error": "Internal server error"}), 500
-
-
-@device_bp.route('/v1/events', methods=['GET'])
-@require_auth
-@swag_from({
-    'tags': ['Events'],
-    'summary': 'Get event code mapping',
-    'description': 'Returns a mapping of all event codes to their descriptions',
-    'responses': {
-        '200': {
-            'description': 'Event code mapping retrieved successfully',
-            'schema': {
-                'type': 'object',
-                'additionalProperties': {
-                    'type': 'string'
-                },
-                'example': {
-                    'I01': 'Starting in normal mode',
-                    'I02': 'Boondock ready and listening',
-                    'E01': 'Unknown error',
-                    'BI01': 'Starting Boondock Echo',
-                    'BI02': 'Online'
-                }
-            }
-        }
-    }
-})
-def get_event_codes():
-    """Get event code mapping for Boondock devices."""
-    # Filter out empty descriptions for cleaner response
-    filtered_mapping = {code: desc for code, desc in EVENT_CODE_MAPPING.items() if desc}
-    return jsonify({
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "event_codes": filtered_mapping
-    }), 200
-
+        ts = datetime.now(timezone.utc).isoformat()
+        body = {"message": "Event received", "timestamp": ts}
+        if warning:
+            body["warning"] = warning
+        if new_token:
+            body["token"] = new_token
+            body["expires_at"] = expires_at
+        return jsonify(body), 200
+    except Exception:
+        logging.exception('device lifecycle event')
+        return jsonify({'error': 'An error occurred processing your request'}), 500
 
 @device_bp.route('/v1/channel-visual-states', methods=['GET'])
-@require_permission(['channel.read'])
+@require_permission(
+    ['channel.read'], loader=load_owned_channels, inject_as='channels'
+)
 @swag_from({
     'tags': ['Events'],
     'summary': 'Get channel visual states',
@@ -961,18 +260,22 @@ def get_event_codes():
         }
     }
 })
-def get_channel_visual_states():
+def get_channel_visual_states(channels):
     """Get visual states for all channels in memory."""
     try:
-        states = get_all_channel_visual_states()
-        return jsonify(states), 200
+        return jsonify(get_all_channel_visual_states(channels)), 200
     except Exception as e:
         error_logger.error(f"Error fetching channel visual states: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
 
 
 @device_bp.route('/v1/channel-visual-states/<mac>', methods=['GET'])
-@require_permission(['channel.read'])
+@require_permission(
+    ['channel.read'],
+    loader=load_request_channel,
+    id_argument='mac',
+    inject_as='channel',
+)
 @swag_from({
     'tags': ['Events'],
     'summary': 'Get visual state for a specific channel',
@@ -990,22 +293,17 @@ def get_channel_visual_states():
         '404': {'description': 'Channel has no visual state'}
     }
 })
-def get_channel_visual_state_by_mac(mac):
+def get_channel_visual_state_by_mac(mac, channel):
     """Get visual state for a specific channel by MAC address."""
     try:
-        state = get_channel_visual_state(mac)
+        state = get_channel_visual_state(channel['mac'])
         if state is None:
             return jsonify({"state": None, "message": "No visual state set for this channel"}), 200
         
-        return jsonify({"mac": normalize_mac_address(mac), "state": state}), 200
+        return jsonify({"mac": channel['mac'], "state": state}), 200
     except Exception as e:
         error_logger.error(f"Error fetching visual state for {mac}: {str(e)}")
         return jsonify({"error": "Internal server error"}), 500
-
-
-def _device_logs_root(mac_key: str) -> str:
-    return DATA_ROOT / "logs" / mac_key.lower()
-
 
 @device_bp.route('/v1/devices/<mac>/logs/files', methods=['GET'])
 @require_admin
@@ -1045,7 +343,6 @@ def device_logs_list_files(mac):
                 continue
     files.sort(key=lambda x: x["path"], reverse=True)
     return jsonify({"files": files, "mac": mac_key}), 200
-
 
 @device_bp.route('/v1/devices/<mac>/logs/content', methods=['GET'])
 @require_admin
@@ -1103,14 +400,16 @@ def device_logs_content(mac):
     except OSError as e:
         return jsonify({"error": str(e)}), 500
 
-
 @device_bp.route('/v1/devices/<mac>/events', methods=['GET'])
-@require_permission(['channel.read'])
-def device_cloud_events_list(mac):
+@require_permission(
+    ['channel.read'],
+    loader=load_request_channel,
+    id_argument='mac',
+    inject_as='channel',
+)
+def device_cloud_events_list(mac, channel):
     """Recent cloud_device_events for this MAC."""
-    mac_key = normalize_mac_address(mac)
-    if len(mac_key) != 12:
-        return jsonify({"error": "Invalid MAC address"}), 400
+    mac_key = channel['mac']
     try:
         limit = int(request.args.get("limit", 100))
     except ValueError:
@@ -1124,11 +423,12 @@ def device_cloud_events_list(mac):
     events = list_cloud_events_for_mac(mac_key, limit=limit, event_types=type_list)
     return jsonify({"events": events, "mac": mac_key}), 200
 
-
 @device_bp.route('/v1/audio/s3', methods=['POST'])
 @device_bp.route('/v2/audio/s3', methods=['POST'])
 @device_bp.route('/upload/audio', methods=['POST'])
-@require_permission(['device', 'recording.create'])
+@require_permission(
+    ['device', 'recording.create'], loader=load_request_channel, inject_as='channel'
+)
 @swag_from({
     'tags': ['Audio'],
     'summary': 'Upload an audio file to S3 (v1: default WAV; v2: default MP3)',
@@ -1146,8 +446,8 @@ def device_cloud_events_list(mac):
             'name': 'mac_address',
             'in': 'formData',
             'type': 'string',
-            'required': True,
-            'description': 'Device MAC address'
+            'required': False,
+            'description': 'Optional MAC consistency check; credential selects the channel'
         },
         {
             'name': 'audio_file',
@@ -1188,10 +488,7 @@ def device_cloud_events_list(mac):
                 'type': 'object',
                 'properties': {
                     'message': {'type': 'string'},
-                    'timestamp': {'type': 'string', 'format': 'date-time'},
-                    'warning': {'type': 'string'},
-                    'new_token': {'type': 'string'},
-                    'expires_at': {'type': 'string', 'format': 'date-time'}
+                    'timestamp': {'type': 'string', 'format': 'date-time'}
                 },
                 'required': ['message', 'timestamp']
             }
@@ -1200,7 +497,7 @@ def device_cloud_events_list(mac):
         '500': {'description': 'Server error during upload or bucket creation'}
     }
 })
-def upload_audio_s3():
+def upload_audio_s3(channel):
     """Upload audio files from Boondock devices to iDrive storage"""
     # Registering a response callback here ensures early validation returns are
     # timed as well as the complete upload path for both routes handled by this
@@ -1212,7 +509,6 @@ def upload_audio_s3():
     request_size = request.content_length
     request_id = uuid.uuid4().hex[:12]
     audio_filename = None
-    deferred_step_logs = []
 
     @after_this_request
     def log_audio_performance(response):
@@ -1294,34 +590,22 @@ def upload_audio_s3():
             json.dumps(request_details, sort_keys=True, default=str),
         )
 
-    log_audio_step("token_loading")
-
-    # 1. ---- Parse auth header --------------------------------------------------
-    auth_header = request.headers.get("Authorization")
-    token = None
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header.split("Bearer ")[1]
-    elif auth_header:
-        logging.warning("Authorization header present but missing 'Bearer ' prefix")
-    log_audio_step("auth_header")
-
-    # 2. ---- Validate form data -------------------------------------------------
+    # 1. ---- Validate form data -------------------------------------------------
     # Wrap form data access in try-except to handle connection errors gracefully
     try:
-        form_data = request.form
         uploaded_files = request.files
         uploaded_audio = uploaded_files.get("audio_file")
         audio_filename = uploaded_audio.filename if uploaded_audio is not None else "Error"
-        if "mac_address" not in form_data or uploaded_audio is None:
-            logging.warning("Missing mac_address or audio_file in request")
+        if uploaded_audio is None:
+            logging.warning("Missing audio_file in request")
             log_audio_request()
             log_audio_step("multipart_parsing")
             return (
-                jsonify({"error": "Missing required fields (mac_address and audio_file)"}),
+                jsonify({"error": "Missing required field (audio_file)"}),
                 400,
             )
 
-        mac_address = request.form["mac_address"]
+        mac_address = channel['mac']
         audio_file = request.files["audio_file"]
         log_audio_step("form_parsing")
         audio_filename = audio_file.filename if audio_file is not None else "Error"
@@ -1369,7 +653,6 @@ def upload_audio_s3():
     timestamp_str = request.form.get("timestamp", "").strip()
     
     # ── Tags (unchanged) --------------------------------------------------------
-    tags_metadata = None
     tagging_header = None
 
     if tags_param:
@@ -1377,8 +660,6 @@ def upload_audio_s3():
             tags_dict = json.loads(tags_param)
             if not isinstance(tags_dict, dict):
                 raise ValueError("tags must be a JSON object")
-
-            tags_metadata = json.dumps(tags_dict)
 
             tag_groups = {}
             for group in ["recorder", "dock", "user"]:
@@ -1405,35 +686,6 @@ def upload_audio_s3():
         utc_now = datetime.now(timezone.utc)
     log_audio_step("upload_metadata")
 
-    # 3. ---- Token-vs-MAC validation (unchanged) --------------------------------
-    warning = None
-    new_token = None
-    expires_at = None
-
-    if not is_mac_registered(mac_address):
-        new_token, expires_at = generate_token(mac_address)
-        warning = "MAC address registered"
-
-    token_valid = (
-        token
-        and get_mac_for_token(token, mac_address)
-        and authenticate_token(token)
-    )
-    logging.debug("token_valid=%s", token_valid)
-
-    if not token_valid:
-        if not new_token:
-            new_token, expires_at = generate_token(mac_address)
-        warning = "Invalid token" if not warning else warning + "; Invalid token"
-
-    logging.debug(
-        "Token validation result for %s: %s. New token issued: %s",
-        mac_address,
-        token_valid,
-        bool(new_token),
-    )
-    log_audio_step("token_validation")
-
     if audio_file.filename == "":
         logging.warning("Empty filename in upload")
         log_audio_step("file_validation")
@@ -1450,16 +702,7 @@ def upload_audio_s3():
         return jsonify({"error": "Unsupported audio file type; expected a WAV file"}), 400
     log_audio_step("file_validation")
 
-    # Get channel_id from MAC address for local storage and database
-    channel_id = get_channel_id_from_mac(mac_address.upper(), refresh=True)
-    if channel_id is None:
-        logging.info(f"Channel ID not found for MAC address: {mac_address}, creating new channel")
-        # Create a new channel for this MAC address
-        channel_id = create_channel_for_mac(mac_address)
-        if channel_id is None:
-            logging.warning(f"Failed to create channel for MAC address: {mac_address}, continuing without local save")
-        else:
-            logging.info(f"Successfully created channel {channel_id} for MAC address: {mac_address}")
+    channel_id = channel['id']
     log_audio_step("channel_lookup")
 
     logging.info("Received file for Channel ID: %s for MAC: %s with timestamp: %s", channel_id, mac_address, utc_now.isoformat())
@@ -1629,11 +872,6 @@ def upload_audio_s3():
                 "message": "Audio uploaded successfully",
                 "timestamp": utc_now.isoformat(),
             }
-            if warning:
-                response["warning"] = warning
-            if new_token:
-                response["new_token"] = new_token
-                response["expires_at"] = expires_at
             if local_file_saved and recording_id:
                 response["recording_id"] = recording_id
                 response["channel_id"] = channel_id
@@ -1737,11 +975,6 @@ def upload_audio_s3():
             "message": "Audio uploaded successfully",
             "timestamp": utc_now.isoformat(),
         }
-        if warning:
-            response["warning"] = warning
-        if new_token:
-            response["new_token"] = new_token
-            response["expires_at"] = expires_at
         if local_file_saved and recording_id:
             response["recording_id"] = recording_id
             response["channel_id"] = channel_id
@@ -1761,7 +994,9 @@ def upload_audio_s3():
 
 @device_bp.route('/V1/upload/logs', methods=['POST'])
 @device_bp.route('/v1/upload/logs', methods=['POST'])
-@require_permission(['device'])
+@require_permission(
+    ['device'], loader=load_request_channel, inject_as='channel'
+)
 @swag_from({
     'tags': ['Logs'],
     'summary': 'Upload log files from ESP32 devices',
@@ -1806,9 +1041,7 @@ def upload_audio_s3():
                     'message': {'type': 'string'},
                     'timestamp': {'type': 'string', 'format': 'date-time'},
                     'file_path': {'type': 'string'},
-                    'warning': {'type': 'string'},
-                    'new_token': {'type': 'string'},
-                    'expires_at': {'type': 'string', 'format': 'date-time'}
+                    'warning': {'type': 'string'}
                 },
                 'required': ['message', 'timestamp', 'file_path']
             }
@@ -1817,12 +1050,8 @@ def upload_audio_s3():
         '500': {'description': 'Internal server error'}
     }
 })
-def upload_logs():
+def upload_logs(channel):
     """Upload log files from ESP32 devices. Files are stored under /logs/<devicemac>/YYYY/MM/YYYY-MM-DD.log or .txt"""
-    
-    # Parse auth header
-    auth_header = request.headers.get('Authorization')
-    token = auth_header.split('Bearer ')[1] if auth_header and auth_header.startswith('Bearer ') else None
     
     # Validate form data - wrap in try-except to handle connection errors gracefully
     try:
@@ -1832,7 +1061,7 @@ def upload_logs():
         if 'file' not in request.files:
             return jsonify({'error': 'No file part in the request'}), 400
         
-        mac_address = request.form['mac_address']
+        mac_address = channel['mac']
         original_filename = request.form['filename']
         file = request.files['file']
     except (OSError, ConnectionResetError, ConnectionError) as e:
@@ -1925,22 +1154,6 @@ def upload_logs():
         error_logger.error(f"Error saving log file: {str(e)}")
         return jsonify({'error': f'Failed to save file: {str(e)}'}), 500
     
-    # Handle token validation (similar to events endpoint)
-    warning_msg = warning
-    new_token = None
-    expires_at = None
-    
-    if not is_mac_registered(mac_address):
-        new_token, expires_at = generate_token(mac_address)
-        warning_msg = 'MAC address registered' if not warning_msg else warning_msg + '; MAC address registered'
-    
-    token_mac = get_mac_for_token(token) if token else None
-    token_valid = token_mac == mac_address and authenticate_token(token) if token_mac else False
-    if not token_valid:
-        if not new_token:
-            new_token, expires_at = generate_token(mac_address)
-        warning_msg = 'Invalid token' if not warning_msg else warning_msg + '; Invalid token'
-    
     timestamp = datetime.now(timezone.utc).isoformat()
     response = {
         'message': 'Log file uploaded successfully',
@@ -1948,16 +1161,15 @@ def upload_logs():
         'file_path': relative_path
     }
     
-    if warning_msg:
-        response['warning'] = warning_msg
-    if new_token:
-        response['new_token'] = new_token
-        response['expires_at'] = expires_at
+    if warning:
+        response['warning'] = warning
     
     return jsonify(response), 200
 
 @device_bp.route('/v1/settings', methods=['POST'])
-@require_permission(['device', 'channel.update'])
+@require_permission(
+    ['device', 'channel.update'], loader=load_request_channel, inject_as='channel'
+)
 @swag_from({
     'tags': ['Settings'],
     'summary': 'Save device settings for Boondock devices',
@@ -1994,10 +1206,7 @@ def upload_logs():
                 'properties': {
                     'message': {'type': 'string'},
                     'timestamp': {'type': 'string', 'format': 'date-time'},
-                    'mac_address': {'type': 'string'},
-                    'warning': {'type': 'string'},
-                    'new_token': {'type': 'string'},
-                    'expires_at': {'type': 'string', 'format': 'date-time'}
+                    'mac_address': {'type': 'string'}
                 },
                 'required': ['message', 'timestamp', 'mac_address']
             }
@@ -2006,31 +1215,13 @@ def upload_logs():
         '500': {'description': 'Server error - Failed to save settings'}
     }
 })
-def save_device_settings():
+def save_device_settings(channel):
     """Save device settings for Boondock devices."""
-    auth_header = request.headers.get('Authorization')
-    token = auth_header.split('Bearer ')[1] if auth_header and auth_header.startswith('Bearer ') else None
-
     if 'mac_address' not in request.form or 'settings' not in request.form:
         return jsonify({'error': 'Missing required fields (mac_address and settings)'}), 400
 
-    mac_address = request.form['mac_address']
+    mac_address = channel['mac']
     settings_str = request.form['settings']
-
-    warning = None
-    new_token = None
-    expires_at = None
-
-    if not is_mac_registered(mac_address):
-        new_token, expires_at = generate_token(mac_address)
-        warning = 'MAC address registered'
-
-    token_mac = get_mac_for_token(token) if token else None
-    token_valid = token_mac == mac_address and authenticate_token(token) if token_mac else False
-    if not token_valid:
-        if not new_token:
-            new_token, expires_at = generate_token(mac_address)
-        warning = 'Invalid token' if not warning else warning + '; Invalid token'
 
     try:
         settings = json.loads(settings_str)
@@ -2053,17 +1244,16 @@ def save_device_settings():
         'timestamp': utc_now.isoformat(),
         'mac_address': mac_address
     }
-    if warning:
-        response['warning'] = warning
-    if new_token:
-        response['new_token'] = new_token
-        response['expires_at'] = expires_at
-
     return jsonify(response), 200
 
 
-@device_bp.route('/v1/settings/<mac_address>', methods=['GET'])
-@require_permission(['device', 'channel.read'])
+@device_bp.route('/v1/settings/<mac>', methods=['GET'])
+@require_permission(
+    ['device', 'channel.read'],
+    loader=load_request_channel,
+    id_argument='mac',
+    inject_as='channel',
+)
 @swag_from({
     'tags': ['Settings'],
     'summary': 'Retrieve device settings for Boondock devices',
@@ -2089,37 +1279,16 @@ def save_device_settings():
             'description': 'Settings retrieved successfully',
             'schema': {
                 'type': 'object',
-                'additionalProperties': True,
-                'properties': {
-                    'warning': {'type': 'string'},
-                    'new_token': {'type': 'string'},
-                    'expires_at': {'type': 'string', 'format': 'date-time'}
-                }
+                'additionalProperties': True
             }
         },
         '404': {'description': 'Settings not found for this device'},
         '500': {'description': 'Server error - Failed to read settings'}
     }
 })
-def get_device_settings(mac_address):
+def get_device_settings(mac, channel):
     """Retrieve device settings for Boondock devices."""
-    auth_header = request.headers.get('Authorization')
-    token = auth_header.split('Bearer ')[1] if auth_header and auth_header.startswith('Bearer ') else None
-
-    warning = None
-    new_token = None
-
-    if not is_mac_registered(mac_address):
-        new_token, expires_at = generate_token(mac_address)
-        warning = 'MAC address registered'
-
-    token_mac = get_mac_for_token(token) if token else None
-    token_valid = token_mac == mac_address and authenticate_token(token) if token_mac else False
-    if not token_valid:
-        if not new_token:
-            new_token, expires_at = generate_token(mac_address)
-        warning = 'Invalid token' if not warning else warning + '; Invalid token'
-
+    mac_address = channel['mac']
     filepath = os.path.join(DEVICE_SETTINGS_DIR, f"{mac_address}.json")
     if not os.path.exists(filepath):
         return jsonify({'error': 'Settings not found for this device'}), 404
@@ -2132,14 +1301,6 @@ def get_device_settings(mac_address):
 
     log_message = f"Settings retrieved - Device: {mac_address}, Filepath: {filepath}"
     logging.info(log_message)
-
-    if warning or new_token:
-        settings = dict(settings)
-        if warning:
-            settings['warning'] = warning
-        if new_token:
-            settings['new_token'] = new_token
-            settings['expires_at'] = expires_at
 
     return jsonify(settings), 200
 

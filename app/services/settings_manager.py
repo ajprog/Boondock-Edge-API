@@ -628,13 +628,38 @@ class SettingsManager:
     
     # ==================== CHANNELS METHODS ====================
     
-    def get_all_channels(self) -> List[Dict[str, Any]]:
-        """Get all channels."""
+    @staticmethod
+    def _channel_owner_filter(owner_ids):
+        """Build a portable channel-owner predicate and its bound values."""
+        owners = []
+        for owner in owner_ids or []:
+            if not isinstance(owner, str) or ':' not in owner:
+                continue
+            owner_type, owner_id = owner.split(':', 1)
+            if owner_type in {'user', 'group'} and owner_id:
+                owners.append((owner_type, owner_id))
+        if not owners:
+            return '0', []
+        clauses = ['(co.owner_type = ? AND co.owner_id = ?)' for _ in owners]
+        values = [value for owner in owners for value in owner]
+        return ' OR '.join(clauses), values
+
+    def get_all_channels(self, owner_ids=None) -> List[Dict[str, Any]]:
+        """Get active channels visible to the supplied owner scope."""
         with _db_lock:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
-                cursor.execute('SELECT * FROM channels ORDER BY id')
+                query = 'SELECT channels.* FROM channels WHERE channels.deleted = 0'
+                parameters = []
+                if owner_ids is not None:
+                    predicate, parameters = self._channel_owner_filter(owner_ids)
+                    query += (
+                        ' AND EXISTS (SELECT 1 FROM channel_owners co '
+                        f'WHERE co.channel_id = channels.id AND ({predicate}))'
+                    )
+                query += ' ORDER BY channels.id'
+                cursor.execute(query, parameters)
                 channels = []
                 for row in cursor.fetchall():
                     channel = dict(row)
@@ -645,13 +670,22 @@ class SettingsManager:
             finally:
                 conn.close()
     
-    def get_channel(self, channel_id: int) -> Optional[Dict[str, Any]]:
+    def get_channel(self, channel_id: int, owner_ids=None) -> Optional[Dict[str, Any]]:
         """Get a channel by ID (excludes soft-deleted channels)."""
         with _db_lock:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
-                cursor.execute('SELECT * FROM channels WHERE id = ? AND deleted = 0', (channel_id,))
+                query = 'SELECT channels.* FROM channels WHERE id = ? AND deleted = 0'
+                parameters = [channel_id]
+                if owner_ids is not None:
+                    predicate, owner_parameters = self._channel_owner_filter(owner_ids)
+                    query += (
+                        ' AND EXISTS (SELECT 1 FROM channel_owners co '
+                        f'WHERE co.channel_id = channels.id AND ({predicate}))'
+                    )
+                    parameters.extend(owner_parameters)
+                cursor.execute(query, parameters)
                 row = cursor.fetchone()
                 if row:
                     channel = dict(row)
@@ -662,7 +696,7 @@ class SettingsManager:
             finally:
                 conn.close()
     
-    def get_channel_by_mac(self, mac: str) -> Optional[Dict[str, Any]]:
+    def get_channel_by_mac(self, mac: str, owner_ids=None) -> Optional[Dict[str, Any]]:
         """Get a channel by MAC address."""
         # Normalize MAC address before querying
         normalized_mac = normalize_mac_address(mac)
@@ -673,7 +707,16 @@ class SettingsManager:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
-                cursor.execute('SELECT * FROM channels WHERE mac = ?', (normalized_mac,))
+                query = 'SELECT channels.* FROM channels WHERE mac = ? AND deleted = 0'
+                parameters = [normalized_mac]
+                if owner_ids is not None:
+                    predicate, owner_parameters = self._channel_owner_filter(owner_ids)
+                    query += (
+                        ' AND EXISTS (SELECT 1 FROM channel_owners co '
+                        f'WHERE co.channel_id = channels.id AND ({predicate}))'
+                    )
+                    parameters.extend(owner_parameters)
+                cursor.execute(query, parameters)
                 row = cursor.fetchone()
                 if row:
                     channel = dict(row)
