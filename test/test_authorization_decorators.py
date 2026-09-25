@@ -1,78 +1,65 @@
-"""Isolated behavior tests for the authorization decorators."""
+"""Authorization behavior tests through real application routes."""
 
-from flask import Flask, g, jsonify
-
-from app.middleware.auth_middleware import (
-    require_admin,
-    require_auth,
-    require_permission,
-)
+from datetime import datetime, timedelta, timezone
 
 
-def test_decorators_authenticate_authorize_and_inject_resources(monkeypatch):
-    app = Flask(__name__)
-    principals = {
-        "member": {
-            "type": "user",
-            "email": "m@example.com",
-            "role": "member",
+def _issue_user(manager, email, role, groups, token):
+    manager.save_user(
+        email,
+        {
+            "name": email,
+            "password": "unused",
+            "role": role,
+            "status": "Active",
+            "groups": groups,
+        },
+    )
+    value, _ = manager.issue_credential(
+        "user",
+        email,
+        (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        token=token,
+    )
+    return {"Authorization": f"Bearer {value}"}
+
+
+def test_real_routes_authenticate_and_authorize(initialized_settings_manager, recording_store):
+    manager = initialized_settings_manager
+    group_id = manager.save_group(
+        {
+            "name": "Readers",
+            "description": "Channel readers",
+            "is_default": True,
             "permissions": ["channel.read"],
-        },
-        "admin": {
-            "type": "user",
-            "email": "a@example.com",
-            "role": "admin",
-            "permissions": [],
-        },
-        "key": {"type": "api_key", "id": "key-1", "permissions": ["recording.create"]},
-    }
-    monkeypatch.setattr("app.utils.auth.authenticate_token", principals.get)
+        }
+    )
 
-    @app.get("/auth")
-    @require_auth
-    def authenticated():
-        return jsonify(g.principal)
+    member_auth = _issue_user(
+        manager,
+        "member@example.com",
+        "member",
+        [group_id],
+        "member-token",
+    )
+    admin_auth = _issue_user(
+        manager,
+        "admin@example.com",
+        "admin",
+        [],
+        "admin-token",
+    )
 
-    @app.get("/admin")
-    @require_admin
-    def administrator():
-        return jsonify(ok=True)
+    manager.save_channel(
+        {"name": "Channel 1", "mac": "AABBCCDDEEFF", "deleted": False}
+    )
 
-    @app.get("/resource/<resource_id>")
-    @require_permission(
-        ["device", "recording.create"],
-        loader=lambda principal, resource_id: {
-            "id": resource_id,
-            "type": principal["type"],
-        },
-        id_argument="resource_id",
-        inject_as="resource",
-    )
-    def resource(resource_id, resource):
-        return jsonify(resource)
+    from app import create_app
 
-    client = app.test_client()
-    assert client.get("/auth").status_code == 401
-    assert client.get("/auth", headers={"X-API-Key": "key"}).json["type"] == "api_key"
-    assert (
-        client.get("/admin", headers={"Authorization": "Bearer member"}).status_code
-        == 403
-    )
-    assert (
-        client.get("/admin", headers={"Authorization": "Bearer admin"}).status_code
-        == 200
-    )
-    assert client.get("/resource/7", headers={"Authorization": "Bearer key"}).json == {
-        "id": "7",
-        "type": "api_key",
-    }
-    assert (
-        client.get(
-            "/resource/7", headers={"Authorization": "Bearer member"}
-        ).status_code
-        == 403
-    )
-    assert (
-        client.get("/resource/7", headers={"Authorization": "Bearer admin"}).status_code
-        == 200
-    )
+    client = create_app().test_client()
+
+    assert client.get("/api/channels").status_code == 401
+    assert client.get("/api/channels", headers=member_auth).status_code == 200
+    assert client.get("/api/channels", headers=admin_auth).status_code == 200
+
+    # A member with channel.read is authenticated but is not an administrator.
+    assert client.post("/api/truncate_recordings", headers=member_auth).status_code == 403

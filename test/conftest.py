@@ -1,43 +1,54 @@
-"""Shared pytest fixtures used across behavior-focused test modules."""
+"""Shared pytest fixtures using the application's real configuration and databases."""
+
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.services import db_initializer
-from app.services import settings_manager as settings_module
+from config import Config
+from app.services import db_initializer, recordings_db_initializer
+from app.services.settings_manager import get_settings_manager
 
 
 @pytest.fixture
-def settings_manager_factory(monkeypatch):
-    """Construct the production SettingsManager against a test database."""
-    managers = []
+def initialized_settings_manager():
+    """Create a clean settings DB at the path selected by real Config."""
+    database = Config.get_settings_db_path()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    if database.exists():
+        database.unlink()
 
-    def create(database):
-        settings_module.SettingsManager._instance = None
-        monkeypatch.setattr(settings_module, "SETTINGS_DB_PATH", database)
-        manager = settings_module.SettingsManager()
-        managers.append(manager)
-        return manager
-
-    yield create
-    settings_module.SettingsManager._instance = None
-
-
-@pytest.fixture
-def initialized_settings_manager(tmp_path, monkeypatch, settings_manager_factory):
-    """Create the production settings schema and return its repository."""
-    database = tmp_path / "settings.db"
-    monkeypatch.setattr(db_initializer.Config, "get_settings_db_path", lambda: database)
     db_initializer._create_database_schema()
-    return settings_manager_factory(database)
+    manager = get_settings_manager()
+
+    yield manager
+
+    if database.exists():
+        database.unlink()
 
 
 @pytest.fixture
-def admin_auth(monkeypatch, initialized_settings_manager):
+def recording_store():
+    """Create a clean recordings DB and recordings directory using real Config."""
+    database = Config.get_recordings_db_path()
+    recordings_dir = Config.get_db_dir().parent / "recordings"
+
+    database.parent.mkdir(parents=True, exist_ok=True)
+    recordings_dir.mkdir(parents=True, exist_ok=True)
+
+    if database.exists():
+        database.unlink()
+
+    recordings_db_initializer.initialize_db()
+
+    yield database, recordings_dir
+
+    if database.exists():
+        database.unlink()
+
+
+@pytest.fixture
+def admin_auth(initialized_settings_manager):
     """Issue a real administrator credential through the production repository."""
-    from datetime import datetime, timedelta, timezone
-
-    from app.utils import auth
-
     manager = initialized_settings_manager
     manager.save_user(
         "admin@example.com",
@@ -55,5 +66,4 @@ def admin_auth(monkeypatch, initialized_settings_manager):
         (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
         token="test-admin-token",
     )
-    monkeypatch.setattr(auth, "_settings_manager", manager)
     return {"Authorization": f"Bearer {token}"}

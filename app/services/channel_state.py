@@ -21,7 +21,7 @@ _channel_states: Dict[str, Dict] = {}
 _last_seen: Dict[str, float] = {}
 _state_lock = threading.Lock()
 
-# > 2× typical device ping interval (60s)
+# > 2x typical device ping interval (60s)
 CLOUD_ACTIVITY_STALE_SECONDS = 150
 
 def _mac_key(mac_address: str) -> str:
@@ -46,13 +46,7 @@ class ChannelVisualState:
     WARNING = "warning"
 
 def set_channel_visual_state(mac_address: str, state: str) -> None:
-    """
-    Set the visual state for a channel in memory.
-
-    Args:
-        mac_address: Channel MAC (any format)
-        state: recording, idle, error, warning, online, offline, etc.
-    """
+    """Set the visual state for a channel in memory."""
     mac = _mac_key(mac_address)
     if not mac:
         return
@@ -73,9 +67,7 @@ def get_stored_visual_state(mac_address: str) -> Optional[str]:
     return None
 
 def get_channel_visual_state(mac_address: str) -> Optional[str]:
-    """
-    Effective visual state: offline if last activity is stale; else stored state.
-    """
+    """Effective visual state: offline if last activity is stale; else stored state."""
     mac = _mac_key(mac_address)
     if not mac:
         return None
@@ -126,39 +118,37 @@ def load_request_channel(principal, value, id_argument):
             channel_id = int(value)
         except (TypeError, ValueError):
             return None
-        return next(
-            (channel for channel in _settings_manager.get_all_channels(owner_ids=owner_ids)
-             if channel.get('id') == channel_id),
-            None,
-        )
+        return _settings_manager.get_channel(channel_id, owner_ids=owner_ids)
     elif id_argument == 'mac':
         mac_address = normalize_mac_address(value) if value else None
         if not mac_address or len(mac_address) != 12:
             return None
         return _settings_manager.get_channel_by_mac(
-            mac_address, owner_ids=principal.get('owner_ids'))
+            mac_address, owner_ids=principal.get('owner_ids')
+        )
     return None
-
 
 """Ownership-scoped recording loaders used by route authorization decorators."""
 
 def _recording_join_scope(principal):
     """Build JOINs and ownership predicates for recording queries."""
-    joins = ["LEFT JOIN channels c ON c.id = recordings.channel_id"]
+    joins = [
+        "LEFT JOIN settings.channels c ON c.id = recordings.channel_id"
+    ]
     clauses = []
     parameters = []
 
     owner_ids = principal.get('owner_ids')
 
-    # Non-device principals with no owner scope are unrestricted (for example admin).
-    if principal.get("type") != "device" and owner_ids is None:
+    # An unrestricted principal (for example an admin) can see every recording.
+    if owner_ids is None:
         return joins, clauses, parameters
 
     predicate, owner_parameters = _settings_manager._channel_owner_filter(owner_ids)
 
-    joins.extend([
-        "JOIN channel_owners co ON co.channel_id = c.id",
-    ])
+    joins.append(
+        "JOIN settings.channel_owners co ON co.channel_id = c.id"
+    )
     clauses.append("c.deleted = 0")
     clauses.append(f"({predicate})")
     parameters.extend(owner_parameters)
@@ -205,6 +195,21 @@ def _recording_request_filters(clauses, parameters):
 
     return hour is not None
 
+def _recording_connection():
+    """Open the recordings DB and attach the real settings DB for ownership joins."""
+    connection = connect_sqlite(
+        Config.get_recordings_db_path(), row_factory=True
+    )
+    try:
+        connection.execute(
+            "ATTACH DATABASE ? AS settings",
+            (str(Config.get_settings_db_path()),),
+        )
+    except Exception:
+        connection.close()
+        raise
+    return connection
+
 def load_request_recording(principal, value, id_argument):
     """Load one recording within the principal's channel scope."""
     joins, clauses, parameters = _recording_join_scope(principal)
@@ -225,9 +230,7 @@ def load_request_recording(principal, value, id_argument):
         LIMIT 1
     """
 
-    with connect_sqlite(
-        Config.get_recordings_db_path(), row_factory=True
-    ) as connection:
+    with _recording_connection() as connection:
         row = connection.execute(query, parameters).fetchone()
 
     return dict(row) if row else None
@@ -254,17 +257,15 @@ def load_owned_recordings(principal, value = None, id_argument = None):
         FROM recordings
         {' '.join(joins)}
         WHERE {' AND '.join(clauses) if clauses else '1'}
-        ORDER BY recordings.timestamp {'ASC' if order_ascending else 'DESC'}, recordings.id {'ASC' if order_ascending else 'DESC'}
+        ORDER BY recordings.timestamp {'ASC' if order_ascending else 'DESC'},
+                 recordings.id {'ASC' if order_ascending else 'DESC'}
     """
 
-    # Fetch one extra row when paginating so the route can report has_more.
     if limit is not None:
         query += " LIMIT ?"
         parameters.append(limit + 1)
 
-    with connect_sqlite(
-        Config.get_recordings_db_path(), row_factory=True
-    ) as connection:
+    with _recording_connection() as connection:
         rows = connection.execute(query, parameters).fetchall()
 
     return [dict(row) for row in rows]

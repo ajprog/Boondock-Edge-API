@@ -1,15 +1,11 @@
-"""Channel API validation tests using the production app and repository."""
+"""Channel API validation tests using the production app, config, and repository."""
 
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from app.routes import channels_routes
-from app.utils import auth
-
-
 @pytest.fixture
-def channel_api(monkeypatch, initialized_settings_manager):
+def channel_api(initialized_settings_manager):
     manager = initialized_settings_manager
     manager.save_group(
         {
@@ -38,9 +34,6 @@ def channel_api(monkeypatch, initialized_settings_manager):
     channel_id = manager.save_channel(
         {"name": "Channel 1", "mac": "AABBCCDDEEFF", "deleted": False}
     )
-
-    monkeypatch.setattr(channels_routes, "_settings_manager", manager)
-    monkeypatch.setattr(auth, "_settings_manager", manager)
 
     from app import create_app
 
