@@ -102,7 +102,7 @@ def upload_audio_queue():
 
 
 @recordings_bp.route('/uploads/<filename>/status', methods=['GET'])
-@require_admin()
+@require_admin
 @swag_from({
     'tags': ['Audio'],
     'summary': 'Get upload processing status',

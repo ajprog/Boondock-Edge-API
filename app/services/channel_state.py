@@ -144,7 +144,7 @@ def load_request_channel(principal, value, id_argument):
 
 def _recording_join_scope(principal):
     """Build JOINs and ownership predicates for recording queries."""
-    joins = ["JOIN channels c ON c.id = recordings.channel_id"]
+    joins = ["LEFT JOIN channels c ON c.id = recordings.channel_id"]
     clauses = []
     parameters = []
 
