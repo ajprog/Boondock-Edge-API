@@ -1,29 +1,13 @@
 import sqlite3
 import threading
-import logging
 from pathlib import Path
 
 import pytest
-from flask import Flask
-
 from app.routes import recordings_routes
 from app.services import audio_handler as audio_handler_service
 
 
-@pytest.fixture(autouse=True)
-def authenticated_recording_request(monkeypatch):
-    """Existing handler regressions run as an authenticated administrator."""
-    monkeypatch.setattr('app.utils.auth.get_request_token', lambda: 'test')
-    monkeypatch.setattr(
-        'app.utils.auth.authenticate_token',
-        lambda token: {
-            'type': 'user', 'email': 'admin@example.com', 'role': 'admin',
-            'permissions': [], 'owner_ids': None,
-        },
-    )
-
-
-class StubAudioHandler:
+class RecordingQuerySpy:
     def __init__(self):
         self.window_arguments = None
         self.count_arguments = None
@@ -55,6 +39,14 @@ class StubAudioHandler:
             "before_id": before_id,
         }
         return {"total": 1}
+
+
+@pytest.fixture
+def recordings_client():
+    from app import create_app
+
+    return create_app().test_client()
+
 
 @pytest.fixture
 def recording_store(tmp_path, monkeypatch):
@@ -89,7 +81,7 @@ def recording_store(tmp_path, monkeypatch):
 def real_audio_handler(recording_store, monkeypatch):
     db_path, _ = recording_store
 
-    class StubSettingsManager:
+    class AudioSettings:
         def get_all_settings(self):
             return {
                 "global_hallucination": False,
@@ -97,9 +89,7 @@ def real_audio_handler(recording_store, monkeypatch):
             }
 
     monkeypatch.setattr(audio_handler_service, "_get_db_path", lambda: db_path)
-    monkeypatch.setattr(
-        audio_handler_service, "_settings_manager", StubSettingsManager()
-    )
+    monkeypatch.setattr(audio_handler_service, "_settings_manager", AudioSettings())
 
     # These query methods only require the handler's database lock. Constructing
     # the full service would unnecessarily start transcription dependencies.
@@ -158,13 +148,6 @@ def _insert_inbox_recording(
         )
 
 
-def _delete_recording(recording_id):
-    app = Flask(__name__)
-    with app.test_request_context():
-        response, status = recordings_routes.delete_recording(recording_id)
-        return response.get_json(), status
-
-
 def test_resolve_recording_path_accepts_files_only_within_recordings_directory(
     recording_store,
 ):
@@ -176,43 +159,44 @@ def test_resolve_recording_path_accepts_files_only_within_recordings_directory(
     assert recordings_routes._resolve_recording_path("../outside.wav") is None
 
 
-def test_serve_audio_returns_existing_file(recording_store):
+def test_serve_audio_returns_existing_file(
+    recording_store, recordings_client, admin_auth
+):
     _, recordings_dir = recording_store
     audio_file = recordings_dir / "device" / "audio.wav"
     audio_file.parent.mkdir()
     audio_file.write_bytes(b"audio contents")
-    app = Flask(__name__)
-    app.register_blueprint(recordings_routes.recordings_bp)
-
-    response = app.test_client().get("/recordings/device/audio.wav")
+    response = recordings_client.get(
+        "/api/recordings/device/audio.wav", headers=admin_auth
+    )
 
     assert response.status_code == 200
     assert response.get_data() == b"audio contents"
 
 
-def test_serve_audio_returns_not_found_for_missing_file(recording_store):
-    app = Flask(__name__)
-    app.register_blueprint(recordings_routes.recordings_bp)
-
-    response = app.test_client().get("/recordings/missing.wav")
+def test_serve_audio_returns_not_found_for_missing_file(
+    recording_store, recordings_client, admin_auth
+):
+    response = recordings_client.get("/api/recordings/missing.wav", headers=admin_auth)
 
     assert response.status_code == 404
 
 
-def test_recording_queries_forward_filters_to_audio_handler(monkeypatch):
-    handler = StubAudioHandler()
+def test_recording_queries_forward_filters_to_audio_handler(
+    monkeypatch, recordings_client, admin_auth
+):
+    handler = RecordingQuerySpy()
     monkeypatch.setattr(recordings_routes, "get_audio_handler", lambda: handler)
-    app = Flask(__name__)
-    app.register_blueprint(recordings_routes.recordings_bp)
-
-    recordings_response = app.test_client().get("/recordings")
-    window_response = app.test_client().get(
-        "/recordings/inbox?limit=25&since_timestamp=20260818_120000"
-        "&before_timestamp=20260818_130000&before_id=9"
+    recordings_response = recordings_client.get("/api/recordings", headers=admin_auth)
+    window_response = recordings_client.get(
+        "/api/recordings/inbox?limit=25&since_timestamp=20260818_120000"
+        "&before_timestamp=20260818_130000&before_id=9",
+        headers=admin_auth,
     )
-    count_response = app.test_client().get(
-        "/recordings/inbox/count?since_timestamp=20260818_120000"
-        "&before_timestamp=20260818_130000&before_id=9"
+    count_response = recordings_client.get(
+        "/api/recordings/inbox/count?since_timestamp=20260818_120000"
+        "&before_timestamp=20260818_130000&before_id=9",
+        headers=admin_auth,
     )
 
     assert recordings_response.get_json() == [
@@ -236,14 +220,17 @@ def test_recording_queries_forward_filters_to_audio_handler(monkeypatch):
     }
 
 
-def test_recording_queries_return_empty_results_without_audio_handler(monkeypatch):
+def test_recording_queries_return_empty_results_without_audio_handler(
+    monkeypatch, recordings_client, admin_auth
+):
     monkeypatch.setattr(recordings_routes, "get_audio_handler", lambda: None)
-    app = Flask(__name__)
-    app.register_blueprint(recordings_routes.recordings_bp)
-
-    recordings_response = app.test_client().get("/recordings")
-    window_response = app.test_client().get("/recordings/inbox?limit=25")
-    count_response = app.test_client().get("/recordings/inbox/count")
+    recordings_response = recordings_client.get("/api/recordings", headers=admin_auth)
+    window_response = recordings_client.get(
+        "/api/recordings/inbox?limit=25", headers=admin_auth
+    )
+    count_response = recordings_client.get(
+        "/api/recordings/inbox/count", headers=admin_auth
+    )
 
     assert recordings_response.get_json() == []
     assert window_response.get_json() == {
@@ -292,7 +279,7 @@ def test_real_audio_handler_applies_keyset_paging_and_count_filters(
 
 
 def test_recordings_inbox_route_integrates_with_real_audio_handler(
-    recording_store, real_audio_handler, monkeypatch
+    recording_store, real_audio_handler, monkeypatch, recordings_client, admin_auth
 ):
     db_path, _ = recording_store
     _insert_inbox_recording(db_path, 1, "20260818_120000")
@@ -300,11 +287,9 @@ def test_recordings_inbox_route_integrates_with_real_audio_handler(
     monkeypatch.setattr(
         recordings_routes, "get_audio_handler", lambda: real_audio_handler
     )
-    app = Flask(__name__)
-    app.register_blueprint(recordings_routes.recordings_bp)
-
-    response = app.test_client().get(
-        "/recordings/inbox?limit=1&since_timestamp=20260818_120000"
+    response = recordings_client.get(
+        "/api/recordings/inbox?limit=1&since_timestamp=20260818_120000",
+        headers=admin_auth,
     )
 
     assert response.status_code == 200
@@ -319,17 +304,19 @@ def test_recordings_inbox_route_integrates_with_real_audio_handler(
     }
 
 
-def test_delete_recording_removes_database_row_and_audio_file(recording_store):
+def test_delete_recording_removes_database_row_and_audio_file(
+    recording_store, recordings_client, admin_auth
+):
     db_path, recordings_dir = recording_store
     audio_file = recordings_dir / "device" / "audio.wav"
     audio_file.parent.mkdir()
     audio_file.write_bytes(b"audio")
     _insert_recording(db_path, 1, "recordings/device/audio.wav")
 
-    body, status = _delete_recording(1)
+    response = recordings_client.delete("/api/recordings/1", headers=admin_auth)
 
-    assert status == 200
-    assert body == {
+    assert response.status_code == 200
+    assert response.get_json() == {
         "message": "Recording deleted successfully",
         "file_deleted": True,
     }
@@ -337,32 +324,38 @@ def test_delete_recording_removes_database_row_and_audio_file(recording_store):
     assert not audio_file.exists()
 
 
-def test_delete_recording_succeeds_when_audio_file_is_already_missing(recording_store):
+def test_delete_recording_succeeds_when_audio_file_is_already_missing(
+    recording_store, recordings_client, admin_auth
+):
     db_path, _ = recording_store
     _insert_recording(db_path, 2, "recordings/device/missing.wav")
 
-    body, status = _delete_recording(2)
+    response = recordings_client.delete("/api/recordings/2", headers=admin_auth)
 
-    assert status == 200
-    assert body == {
+    assert response.status_code == 200
+    assert response.get_json() == {
         "message": "Recording deleted successfully",
         "file_deleted": False,
     }
     assert not _recording_exists(db_path, 2)
 
 
-def test_delete_recording_rejects_path_outside_recordings_directory(recording_store):
+def test_delete_recording_rejects_path_outside_recordings_directory(
+    recording_store, recordings_client, admin_auth
+):
     db_path, _ = recording_store
     _insert_recording(db_path, 3, "../outside.wav")
 
-    body, status = _delete_recording(3)
+    response = recordings_client.delete("/api/recordings/3", headers=admin_auth)
 
-    assert status == 400
-    assert body == {"error": "Invalid recording file path"}
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "Invalid recording file path"}
     assert _recording_exists(db_path, 3)
 
 
-def test_delete_recording_reports_file_deletion_failure(recording_store, monkeypatch):
+def test_delete_recording_reports_file_deletion_failure(
+    recording_store, monkeypatch, recordings_client, admin_auth
+):
     db_path, recordings_dir = recording_store
     audio_file = recordings_dir / "undeletable.wav"
     audio_file.write_bytes(b"audio")
@@ -377,10 +370,10 @@ def test_delete_recording_reports_file_deletion_failure(recording_store, monkeyp
 
     monkeypatch.setattr(Path, "unlink", fail_for_audio_file)
 
-    body, status = _delete_recording(4)
+    response = recordings_client.delete("/api/recordings/4", headers=admin_auth)
 
-    assert status == 500
-    assert body == {
+    assert response.status_code == 500
+    assert response.get_json() == {
         "error": "Recording deleted from database, but audio file deletion failed",
         "recording_id": 4,
     }

@@ -17,21 +17,10 @@ def get_request_token():
         return authorization[7:].strip() or None
     return (request.headers.get('X-API-Key') or '').strip() or None
 
-def authenticate(device_request=False):
+def authenticate():
     """Get the token and authenticate it."""
     token = get_request_token()
     if not token:
-        if device_request:
-            mac_address = (
-                request.headers.get('X-Device-MAC')
-                or request.args.get('mac')
-                or request.form.get('mac_address')
-                or ''
-            )
-        log.info(
-            'authentication_rejected route=%s token= result=missing',
-            request.path,
-        )
         return jsonify({'error': 'Authentication required'}), 401
     principal = authenticate_token(token)
     if principal is None:
