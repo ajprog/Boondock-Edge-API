@@ -48,7 +48,7 @@ def get_samba_settings():
     try:
         settings = _settings_manager.get_all_settings()
         return {
-            'enabled': settings.get('samba_backup_enabled', False),
+            'enabled': settings.get('samba_enabled', False),
             'share_path': settings.get('samba_share_path', '').strip(),
             'username': settings.get('samba_username', '').strip(),
             'password': settings.get('samba_password', '').strip(),
@@ -1215,4 +1215,3 @@ def run_backup_job(manual=False, backup_type='incremental', destination='both'):
         
         error_logger.error(f"Backup job failed: {str(e)}", exc_info=True)
         # Don't raise - backup failures shouldn't crash the app
-

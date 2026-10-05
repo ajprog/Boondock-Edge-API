@@ -12,6 +12,7 @@ from ..middleware.auth_middleware import require_permission
 
 from ..utils.logging_setup import error_logger
 from ..services.transcription_service import request_openai_transcription
+from ..services.recording_state import update_transcription as persist_transcription
 from ..routes.route_utils import (
     DB_PATH,
     create_history_entry,
@@ -126,10 +127,7 @@ def update_transcription(message_id):
             print(f"Warning: Failed to create history entry: {e}")
 
         # Update transcription in DB (always)
-        cur.execute(
-            "UPDATE recordings SET transcription = ? WHERE id = ?",
-            (transcription, message_id)
-        )
+        persist_transcription(conn, message_id, transcription)
         conn.commit()
 
         return jsonify({
@@ -329,11 +327,7 @@ def transcribe_proxy_by_id(record_id):
 
             # Save transcription to DB
             with sqlite3.connect(DB_PATH) as conn:
-                cur = conn.cursor()
-                cur.execute(
-                    "UPDATE recordings SET transcription = ? WHERE id = ?",
-                    (api_response['transcription'], record_id)
-                )
+                persist_transcription(conn, record_id, api_response['transcription'])
                 conn.commit()
 
             resp = jsonify(formatted_response)

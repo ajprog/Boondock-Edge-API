@@ -76,7 +76,7 @@ def _create_authorization_tables(connection):
             principal_type TEXT NOT NULL CHECK (
                 principal_type IN ('user', 'api_key', 'device')
             ),
-            principal_id TEXT NOT NULL,
+            principal_id INTEGER NOT NULL,
             token_hash TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL,
             expires_at TEXT
@@ -110,7 +110,7 @@ def _create_authorization_tables(connection):
 def _create_api_keys_table(connection):
     connection.execute("""
         CREATE TABLE api_keys (
-            id TEXT PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             permissions TEXT NOT NULL,
             owner TEXT NOT NULL,
@@ -145,11 +145,11 @@ def _migrate_api_keys(connection, default_group_id):
                     continue
         except (TypeError, ValueError):
             continue
-        connection.execute(
+        cursor = connection.execute(
             """INSERT INTO api_keys
-               (id, name, permissions, owner, created_at, created_by)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (api_key["id"], api_key["name"],
+               (name, permissions, owner, created_at, created_by)
+               VALUES (?, ?, ?, ?, ?)""",
+            (api_key["name"],
              json.dumps(_permissions(api_key["scopes"])),
              f"group:{default_group_id}", api_key["created_at"] or _now_iso(),
              api_key["created_by"]),
@@ -158,7 +158,7 @@ def _migrate_api_keys(connection, default_group_id):
             """INSERT INTO credentials
                (id, principal_type, principal_id, token_hash, created_at, expires_at)
                VALUES (?, 'api_key', ?, ?, ?, ?)""",
-            (str(uuid.uuid4()), api_key["id"], api_key["key_hash"],
+            (str(uuid.uuid4()), cursor.lastrowid, api_key["key_hash"],
              api_key["created_at"] or _now_iso(), expires_at),
         )
     connection.execute("DROP TABLE api_keys_legacy")

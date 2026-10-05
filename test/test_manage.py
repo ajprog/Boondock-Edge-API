@@ -62,6 +62,7 @@ def test_load_setup_rejects_unknown_device(tmp_path):
 
 def _initialize_and_capture_settings(monkeypatch, tmp_path, document):
     saved_settings = {}
+    saved_users = {}
     autoconfigured = []
 
     class SettingsManager:
@@ -69,6 +70,7 @@ def _initialize_and_capture_settings(monkeypatch, tmp_path, document):
             return None
 
         def save_user(self, email, user):
+            saved_users[email] = user
             return True
 
         def set_all_settings(self, settings):
@@ -77,7 +79,7 @@ def _initialize_and_capture_settings(monkeypatch, tmp_path, document):
 
         def get_all_settings(self):
             return {
-                "host_ssid": "boondockedge",
+                "ssid": "boondockedge",
                 "host_password": "edge@123",
                 "host_ip": "10.42.0.1",
                 "host_port": "4000",
@@ -99,19 +101,22 @@ def _initialize_and_capture_settings(monkeypatch, tmp_path, document):
 
     manage.initialize(document)
 
-    return saved_settings, autoconfigured
+    return saved_settings, saved_users, autoconfigured
 
 
 def test_initialize_writes_installer_wifi_settings(monkeypatch, tmp_path):
     document = _setup_document()
 
-    saved_settings, autoconfigured = _initialize_and_capture_settings(monkeypatch, tmp_path, document)
+    saved_settings, saved_users, autoconfigured = _initialize_and_capture_settings(
+        monkeypatch, tmp_path, document
+    )
 
     assert not (tmp_path / "db" / "admin.json").exists()
-    assert saved_settings["host_ssid"] == "boondockedge"
+    assert saved_settings["ssid"] == "boondockedge"
     assert saved_settings["host_password"] == "edge@123"
     assert saved_settings["host_ip"] == "10.42.0.1"
     assert "hotspot_initial_setup_done" not in saved_settings
+    assert saved_users["Admin@Example.com"]["preferences"]["inbox"]["records_per_page"] == 0
     assert len(autoconfigured) == 1
 
 
@@ -119,7 +124,7 @@ def test_initialize_skips_usb_autoconfig_without_boondock_edge(monkeypatch, tmp_
     document = _setup_document()
     document["selected_devices"] = ["usb_audio"]
 
-    _, autoconfigured = _initialize_and_capture_settings(monkeypatch, tmp_path, document)
+    _, _, autoconfigured = _initialize_and_capture_settings(monkeypatch, tmp_path, document)
 
     assert autoconfigured == []
 
@@ -144,7 +149,7 @@ def test_auto_configures_all_connected_edge_usb_devices(monkeypatch):
     class SettingsManager:
         def get_all_settings(self):
             return {
-                "host_ssid": "boondockedge",
+                "ssid": "boondockedge",
                 "host_password": "edge@123",
                 "host_ip": "10.42.0.1",
                 "host_port": "4000",

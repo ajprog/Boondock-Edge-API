@@ -13,7 +13,6 @@ def test_api_key_issuer_writes_principal_and_shared_credential(
             "name": "Admin",
             "password": "unused",
             "role": "admin",
-            "status": "Active",
             "groups": [],
         },
     )

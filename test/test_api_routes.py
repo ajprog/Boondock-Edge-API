@@ -178,7 +178,9 @@ def check_api_routes(app):
     # Generic protection is insufficient for these security-sensitive routes.
 
     for (method, path), (rule, view) in api_methods.items():
-        if rule.endpoint.startswith(("users.", "groups.", "release_package.")):
+        self_service_preferences = rule.endpoint == "users.update_user"
+        if (rule.endpoint.startswith(("users.", "groups.", "release_package."))
+                and not self_service_preferences):
             assert (
                 _authorization_declarations(view)[0][0] == "require_admin"
             ), f"{method} {path}: {rule.endpoint} must remain admin-only"

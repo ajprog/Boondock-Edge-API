@@ -9,6 +9,7 @@ from config import DATA_ROOT
 from datetime import datetime, timezone
 from ..utils.logging_setup import error_logger
 from ..services.settings_manager import get_settings_manager
+from ..services.recording_state import update_transcription as persist_transcription
 
 # Path constants - use absolute paths based on this file's location
 RECORDINGS_DIR = DATA_ROOT / 'recordings'
@@ -404,37 +405,6 @@ def format_utc_timestamp(timestamp_value):
         print(f"Error formatting UTC timestamp: {e}")
         return timestamp_value
 
-# Pagination preferences
-def load_pagination_preferences():
-    """Load pagination preferences from database."""
-    try:
-        # Get all users and their pagination preferences
-        all_users = _settings_manager.get_all_users()
-        prefs = {}
-        for email in all_users.keys():
-            user_prefs = _settings_manager.get_pagination_prefs(email)
-            if user_prefs:
-                prefs[email] = {
-                    'recordsPerPage': user_prefs.get('records_per_page'),
-                    'currentPage': user_prefs.get('current_page'),
-                    'reverseSort': bool(user_prefs.get('reverse_sort')),
-                    'showFullTimestamps': bool(user_prefs.get('show_full_timestamps'))
-                }
-        return prefs
-    except Exception as e:
-        error_logger.error(f"Error loading pagination preferences: {str(e)}")
-        return {}
-
-def save_pagination_preferences(preferences):
-    """Save pagination preferences to database."""
-    try:
-        for email, prefs in preferences.items():
-            _settings_manager.save_pagination_prefs(email, prefs)
-        return True
-    except Exception as e:
-        error_logger.error(f"Error saving pagination preferences: {e}")
-        return False
-
 # History management functions
 import shutil
 
@@ -599,10 +569,7 @@ def revert_to_version(recording_id, version_number):
         current_path = DATA_ROOT / current_filename
         
         # Update the current recording with the historical transcription
-        cur.execute(
-            "UPDATE recordings SET transcription = ? WHERE id = ?",
-            (transcription, recording_id)
-        )
+        persist_transcription(conn, recording_id, transcription)
         
         # If there was a history audio file, restore it
         if history_audio_filename:

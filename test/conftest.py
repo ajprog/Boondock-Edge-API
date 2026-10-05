@@ -56,7 +56,6 @@ def admin_auth(initialized_settings_manager):
             "name": "Admin",
             "password": "unused",
             "role": "admin",
-            "status": "Active",
             "groups": [],
         },
     )

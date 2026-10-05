@@ -39,17 +39,17 @@ def _create_database_schema():
         # Users table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS users (
-                email TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
                 password TEXT NOT NULL,
                 role TEXT,
-                status TEXT,
-                access_level TEXT,
-                mfa_enabled INTEGER DEFAULT 0,
+                mfa_enabled BOOLEAN DEFAULT FALSE,
+                mfa_enforced BOOLEAN DEFAULT FALSE,
+                mfa_secret TEXT,
                 created_at TEXT,
-                login_history TEXT,
-                devices TEXT,
-                groups TEXT NOT NULL DEFAULT '[]'
+                groups JSON NOT NULL DEFAULT '[]',
+                preferences JSON NOT NULL DEFAULT '{}'
             )
         ''')
 
@@ -96,7 +96,7 @@ def _create_database_schema():
                 person TEXT,
                 tag TEXT,
                 mac TEXT UNIQUE NOT NULL,
-                audio_stream_enabled INTEGER DEFAULT 0,
+                audio_stream_enabled BOOLEAN DEFAULT FALSE,
                 threshold TEXT,
                 silence TEXT,
                 min_rec TEXT,
@@ -105,10 +105,12 @@ def _create_database_schema():
                 frequency REAL,
                 tone TEXT,
                 type TEXT,
-                deleted INTEGER DEFAULT 0,
+                deleted BOOLEAN DEFAULT FALSE,
                 audio_stream_port INTEGER,
-                speaker_enabled INTEGER DEFAULT 0,
-                speaker_volume INTEGER
+                speaker_enabled BOOLEAN DEFAULT FALSE,
+                speaker_volume INTEGER,
+                device_hostname TEXT,
+                device_ip TEXT
             )
         ''')
 
@@ -125,8 +127,20 @@ def _create_database_schema():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 description TEXT,
-                is_default INTEGER NOT NULL DEFAULT 0,
-                permissions TEXT NOT NULL
+                is_default BOOLEAN NOT NULL DEFAULT FALSE,
+                permissions JSON NOT NULL DEFAULT '[]',
+                default_preferences JSON NOT NULL DEFAULT
+                    '{"display":{},"inbox":{},"reports":{}}',
+                keywords JSON NOT NULL DEFAULT '[]'
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS keywords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern TEXT NOT NULL,
+                match_type TEXT NOT NULL DEFAULT 'literal'
+                    CHECK (match_type IN ('literal', 'regex')),
+                case_sensitive BOOLEAN NOT NULL DEFAULT FALSE
             )
         ''')
         cursor.execute('''
@@ -135,7 +149,7 @@ def _create_database_schema():
                 principal_type TEXT NOT NULL CHECK (
                     principal_type IN ('user', 'api_key', 'device')
                 ),
-                principal_id TEXT NOT NULL,
+                principal_id INTEGER NOT NULL,
                 token_hash TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL,
                 expires_at TEXT
@@ -145,9 +159,9 @@ def _create_database_schema():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_credentials_expires_at ON credentials(expires_at)')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS api_keys (
-                id TEXT PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                permissions TEXT NOT NULL,
+                permissions JSON NOT NULL,
                 owner TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 created_by TEXT
@@ -175,26 +189,15 @@ def _create_database_schema():
                 (datetime.now(timezone.utc).isoformat(),)
             )
 
-        # Pagination preferences table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS pagination_preferences (
-                email TEXT PRIMARY KEY,
-                records_per_page INTEGER,
-                current_page INTEGER,
-                reverse_sort INTEGER DEFAULT 0,
-                show_full_timestamps INTEGER DEFAULT 0
-            )
-        ''')
-
         # Branding table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS branding (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 organization_name TEXT,
                 tagline TEXT,
-                brand_colors TEXT,
+                brand_colors JSON,
                 font TEXT,
-                assets TEXT
+                assets JSON
             )
         ''')
 
@@ -202,7 +205,10 @@ def _create_database_schema():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS hallucinations (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                data TEXT
+                pattern TEXT NOT NULL,
+                match_type TEXT NOT NULL DEFAULT 'literal'
+                    CHECK (match_type IN ('literal', 'regex')),
+                case_sensitive BOOLEAN NOT NULL DEFAULT FALSE
             )
         ''')
 
@@ -214,7 +220,7 @@ def _create_database_schema():
                 end_time TEXT,
                 duration INTEGER,
                 status TEXT,
-                manual INTEGER DEFAULT 0,
+                manual BOOLEAN DEFAULT FALSE,
                 backup_type TEXT,
                 destination TEXT,
                 uploaded_files INTEGER DEFAULT 0,
@@ -249,7 +255,7 @@ def _create_database_schema():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS recorders_inventory (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                data TEXT
+                data JSON
             )
         ''')
 
@@ -281,18 +287,14 @@ def _create_database_schema():
 # Default settings rows that must always exist.
 DEFAULT_SETTINGS = {
     "event_name": "default",
-    "global_model": "tiny.en",
-    "global_target_language": "english",
-    "global_transcribe_local": True,
-    "global_transcribe_openai": False,
-    "global_transcribe_node": False,
-    "global_hallucination": False,
-    "global_enable_uniden_scanners": False,
-    "global_enable_edge_devices": True,
+    "model": "tiny.en",
+    "target_language": "english",
+    "method": "local",
+    "uniden_scanners_enabled": False,
+    "edge_recorders_enabled": True,
+    "transcription_queue_enabled": True,
     "transcription_endpoint": "https://api.boondock.cloud",
     "api_health_url": "https://api.boondock.cloud/health",
-    "api_transcription_url": "https://api.boondock.cloud/transcribe/",
-    "keywords": ["emergency", "fire", "police", "medical", "police", "medical", "police", "medical"],
     "global_min_record_secs": 1,
     "global_max_record_secs": 30,
     "global_silence_secs": 1,
@@ -300,14 +302,13 @@ DEFAULT_SETTINGS = {
     "global_post_record_ms": 1000,
     "global_rms_threshold": 30,
     "global_discard_secs": 1,
-    "global_enable_s3_upload": False,
+    "s3_enabled": False,
     "s3_endpoint_url": "",
     "s3_access_key": "",
     "s3_secret_key": "",
-    "s3_region": "",
+    "s3_region": "us-east-1",
     "s3_bucket_name": "",
-    "s3_backup_time": "03:00",
-    "host_ssid": "boondockedge",
+    "ssid": "boondockedge",
     "host_password": "edge@123",
     "host_ip": "10.42.0.1",
     "host_port": "4000",
@@ -315,17 +316,12 @@ DEFAULT_SETTINGS = {
     "button_long_press_duration": 3.0,
     "relay_enabled": False,
     "usb_power_enabled": False,
-    "samba_backup_enabled": False,
+    "samba_enabled": False,
     "samba_share_path": "",
     "samba_username": "",
     "samba_password": "",
-    "global_inbox_view_mode": "pagination",
-    "global_inbox_records_per_page": 20,
-    "global_enable_usb_audio_devices": False,
-    "global_show_duplicate_files": False,
-    "global_live_mode_enabled": False,
-    "maintenance_time": "03:00",
-    "maintenance_enabled_tasks": ["data_backup", "logs_cleanup", "disk_usage_calculation"],
+    "scheduled_time": "03:00",
+    "enabled_tasks": ["data_backup", "logs_cleanup", "health_checks"],
 }
 
 def _ensure_default_settings_rows(settings_manager, existing_settings=None):

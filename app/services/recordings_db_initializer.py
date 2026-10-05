@@ -1,5 +1,3 @@
-import sqlite3
-import json
 from config import Config
 from app.utils.sqlite_utils import connect_sqlite
 
@@ -20,54 +18,19 @@ def initialize_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             channel_id INTEGER,
             filename TEXT,
-            timestamp TEXT,
+            timestamp INTEGER,
             transcription TEXT,
             status TEXT DEFAULT 'new',
-            backed_up INTEGER DEFAULT 0,
-            is_duplicate INTEGER DEFAULT 0,
+            backed_up BOOLEAN DEFAULT FALSE,
+            is_duplicate BOOLEAN DEFAULT FALSE,
             filesize INTEGER DEFAULT 0,
             duration REAL,
-            crc TEXT
+            crc TEXT,
+            is_hallucination BOOLEAN NOT NULL DEFAULT FALSE,
+            updated_at INTEGER NOT NULL DEFAULT
+                (CAST(strftime('%s', 'now') AS INTEGER) * 1000)
         )
     ''')
-
-    #Add backed_up column if it doesn't exist (for existing databases)
-    try:
-        cursor.execute('ALTER TABLE recordings ADD COLUMN backed_up INTEGER DEFAULT 0')
-    except sqlite3.OperationalError:
-        # Column already exists, ignore
-        pass
-    
-    # Add is_duplicate column if it doesn't exist (for existing databases)
-    try:
-        cursor.execute('ALTER TABLE recordings ADD COLUMN is_duplicate INTEGER DEFAULT 0')
-    except sqlite3.OperationalError:
-        # Column already exists, ignore
-        pass
-    
-    # Add crc column if it doesn't exist (for existing databases)
-    try:
-        cursor.execute('ALTER TABLE recordings ADD COLUMN crc TEXT')
-    except sqlite3.OperationalError:
-        pass
-
-    # Add filesize column if it doesn't exist
-    try:
-        cursor.execute('ALTER TABLE recordings ADD COLUMN filesize INTEGER')
-    except sqlite3.OperationalError:
-        pass
-
-    # Add duration column if it doesn't exist
-    try:
-        cursor.execute('ALTER TABLE recordings ADD COLUMN duration REAL')
-    except sqlite3.OperationalError:
-        pass
-
-    # Add status column if it doesn't exist
-    try:
-        cursor.execute("ALTER TABLE recordings ADD COLUMN status TEXT DEFAULT 'new'")
-    except sqlite3.OperationalError:
-        pass
     
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_recordings_timestamp 
@@ -115,7 +78,7 @@ def initialize_db():
             completed_at TIMESTAMP,
             duration_seconds REAL,
             status TEXT NOT NULL,
-            details TEXT,
+            details JSON,
             error_message TEXT
         )
     ''')
@@ -140,7 +103,7 @@ def initialize_db():
             audio_files_size_bytes INTEGER,
             logs_size_bytes INTEGER,
             database_size_bytes INTEGER,
-            per_channel_usage TEXT,
+            per_channel_usage JSON,
             total_disk_used_bytes INTEGER,
             total_disk_available_bytes INTEGER
         )

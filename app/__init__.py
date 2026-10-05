@@ -96,7 +96,6 @@ def create_app(config_class=Config):
     from app.routes.tags_routes import tags_bp
     from app.routes.frequencies_routes import frequencies_bp
     from app.routes.incident_reports_routes import incident_reports_bp
-    from app.routes.pagination_routes import pagination_bp
     from app.routes.maintenance_routes import maintenance_bp
     from app.routes.health_routes import health_bp, notification_bp
     from app.routes.docs_routes import docs_bp
@@ -127,7 +126,6 @@ def create_app(config_class=Config):
     app.register_blueprint(tags_bp, url_prefix='/api')
     app.register_blueprint(frequencies_bp, url_prefix='/api')
     app.register_blueprint(incident_reports_bp, url_prefix='/api')
-    app.register_blueprint(pagination_bp, url_prefix='/api')
     app.register_blueprint(maintenance_bp, url_prefix='/api')
     app.register_blueprint(health_bp, url_prefix='/api/health')
     app.register_blueprint(notification_bp, url_prefix='/api/notifications')
@@ -156,7 +154,7 @@ def create_app(config_class=Config):
             audio_handler = get_audio_handler()
             from app.services.settings_manager import get_settings_manager
             queue_enabled = get_settings_manager().get_setting(
-                'global_transcription_queue_enabled', True
+                'transcription_queue_enabled', True
             )
             if queue_enabled and audio_handler and not getattr(audio_handler, "running", False):
                 audio_handler.start()

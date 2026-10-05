@@ -7,6 +7,7 @@ import sqlite3
 import logging
 import wave
 import re
+import time
 from config import DATA_ROOT
 from datetime import datetime, timedelta, timezone
 from flask import Blueprint, jsonify, request, send_from_directory, send_file, abort
@@ -25,7 +26,7 @@ from ..routes.route_utils import (
     calculate_wav_duration,
 )
 from ..services.settings_manager import get_settings_manager
-from ..services.channel_state import load_owned_recordings, load_request_recording
+from ..services.channel_state import load_inbox, load_owned_recordings, load_request_recording
 from ..services.device_health_monitor import (
     track_device_created,
     track_file_upload,
@@ -195,7 +196,7 @@ def start_queue():
             response.headers['Content-Type'] = 'application/json'
             return response, 200
         audio_handler.start()
-        _settings_manager.set_setting('global_transcription_queue_enabled', True)
+        _settings_manager.set_setting('transcription_queue_enabled', True)
         response = jsonify({'message': 'Transcription queue started', 'is_running': True})
         response.headers['Content-Type'] = 'application/json'
         return response, 200
@@ -223,7 +224,7 @@ def stop_queue():
         if not audio_handler:
             return jsonify({'error': 'Audio handler not initialized'}), 500
         audio_handler.stop_queue()
-        _settings_manager.set_setting('global_transcription_queue_enabled', False)
+        _settings_manager.set_setting('transcription_queue_enabled', False)
         response = jsonify({'message': 'Transcription queue stopped', 'is_running': False})
         response.headers['Content-Type'] = 'application/json'
         return response, 200
@@ -495,47 +496,46 @@ def purge_queue_logs():
         return response, 500
 
 
-@recordings_bp.route('/recordings')
-@require_permission(['recording.read'], loader=load_owned_recordings, inject_as='recordings')
-@swag_from({
-    'tags': ['Recordings'],
-    'summary': 'Get all recordings',
-    'responses': {
-        '200': {'description': 'List of all recordings'}
-    }
-})
-def get_recordings(recordings):
-    return jsonify(recordings)
-
-
 @recordings_bp.route('/recordings/inbox', methods=['GET'])
-@recordings_bp.route('/recordings/inbox/range', methods=['GET'])
-@require_permission(['recording.read'], loader=load_owned_recordings, inject_as='recordings')
+@require_permission(['recording.read'], loader=load_inbox, inject_as='result')
 @swag_from({
     'tags': ['Recordings'],
     'summary': 'Retrieve inbox recordings',
-    'description': 'Get a bounded inbox window of recordings',
+    'description': 'Initial, older-window, and update-poll reads use one endpoint.',
     'parameters': [
+        {
+            'name': 'channel_ids', 'in': 'query', 'type': 'string',
+            'required': False, 'description': 'Comma-separated active channel IDs'
+        },
         {
             'name': 'limit',
             'in': 'query',
             'type': 'integer',
             'required': False,
-            'description': 'Maximum number of recordings to return (default 1000, max 5000)'
+            'description': 'Requested batch size (1-500)'
         },
         {
-            'name': 'since_timestamp',
+            'name': 'start_at',
             'in': 'query',
-            'type': 'string',
+            'type': 'integer',
             'required': False,
-            'description': 'Lower bound timestamp (inclusive), format YYYYMMDD_HHMMSS'
+            'description': 'Inclusive recording time in UTC Unix milliseconds'
+        },
+        {
+            'name': 'end_at', 'in': 'query', 'type': 'integer',
+            'required': False,
+            'description': 'Inclusive recording time in UTC Unix milliseconds; not valid for polls'
+        },
+        {
+            'name': 'sort_direction', 'in': 'query', 'type': 'string',
+            'required': False, 'enum': ['newest_first', 'oldest_first']
         },
         {
             'name': 'before_timestamp',
             'in': 'query',
-            'type': 'string',
+            'type': 'integer',
             'required': False,
-            'description': 'Keyset upper bound timestamp (exclusive), format YYYYMMDD_HHMMSS'
+            'description': 'Older-window recording time in UTC Unix milliseconds'
         },
         {
             'name': 'before_id',
@@ -543,79 +543,27 @@ def get_recordings(recordings):
             'type': 'integer',
             'required': False,
             'description': 'Tie-breaker ID for before_timestamp keyset paging'
+        },
+        {
+            'name': 'updated_since', 'in': 'query', 'type': 'integer',
+            'required': False,
+            'description': 'Inclusive updated_at boundary selecting poll mode'
+        },
+        {
+            'name': 'offset', 'in': 'query', 'type': 'integer',
+            'required': False,
+            'description': 'Follow-up offset for a capacity-limited poll'
         }
     ],
     'responses': {
         '200': {'description': 'Inbox recordings window'},
+        '400': {'description': 'Invalid query parameters'},
         '500': {'description': 'Server error'}
     }
 })
-def get_recordings_inbox(recordings):
-    try:
-        limit = request.args.get('limit', default=1000, type=int) or 1000
-        limit = max(1, min(limit, 5000))
-
-        has_more = len(recordings) > limit
-        recordings = recordings[:limit]
-        last = recordings[-1] if recordings else None
-
-        return jsonify({
-            'recordings': recordings,
-            'meta': {
-                'limit': limit,
-                'returned': len(recordings),
-                'has_more': has_more,
-                'next_before_timestamp': last.get('timestamp') if has_more and last else None,
-                'next_before_id': last.get('id') if has_more and last else None,
-            }
-        }), 200
-    except Exception as e:
-        error_logger.error(f"Error getting inbox recordings window: {str(e)}")
-        return jsonify({'error': 'Internal server error'}), 500
-
-
-
-@recordings_bp.route('/recordings/inbox/count', methods=['GET'])
-@require_permission(['recording.read'], loader=load_owned_recordings, inject_as='recordings')
-@swag_from({
-    'tags': ['Recordings'],
-    'summary': 'Total inbox count for a time window',
-    'description': (
-        'Returns the total number of recordings that match the given time window/filters. '
-        'Used by the dashboard footer so it can show "Showing X-Y of <real total>" without '
-        'having to load every row first.'
-    ),
-    'parameters': [
-        {
-            'name': 'since_timestamp',
-            'in': 'query',
-            'type': 'string',
-            'required': False,
-            'description': 'Lower bound timestamp (inclusive), format YYYYMMDD_HHMMSS'
-        },
-        {
-            'name': 'before_timestamp',
-            'in': 'query',
-            'type': 'string',
-            'required': False,
-            'description': 'Upper bound timestamp (exclusive), format YYYYMMDD_HHMMSS'
-        },
-        {
-            'name': 'before_id',
-            'in': 'query',
-            'type': 'integer',
-            'required': False,
-            'description': 'Tie-breaker ID for before_timestamp'
-        }
-    ],
-    'responses': {
-        '200': {'description': 'Total count for the window'},
-        '500': {'description': 'Server error'}
-    }
-})
-def get_recordings_inbox_count(recordings):
-    """Return total recordings count matching the inbox window filters."""
-    return jsonify({'total': len(recordings)}), 200
+def get_recordings_inbox(result):
+    payload, status = result
+    return jsonify(payload), status
 
 
 @recordings_bp.route('/recordings/<path:filename>')
@@ -898,7 +846,16 @@ def get_recording_duration(recording_id, recording):
                 # Store duration in database for future use
                 try:
                     conn = sqlite3.connect(DB_PATH)
-                    conn.execute("UPDATE recordings SET duration = ? WHERE id = ?", (duration_seconds, recording_id))
+                    conn.execute(
+                        """UPDATE recordings
+                           SET duration = ?, updated_at = MAX(updated_at + 1, ?)
+                           WHERE id = ?""",
+                        (
+                            duration_seconds,
+                            time.time_ns() // 1_000_000,
+                            recording_id,
+                        ),
+                    )
                     conn.commit()
                 except Exception as e:
                     error_logger.error(f"Failed to store duration in database: {e}")
@@ -922,8 +879,14 @@ def get_recording_duration(recording_id, recording):
                         if conn is None:
                             conn = sqlite3.connect(DB_PATH)
                         conn.execute(
-                            "UPDATE recordings SET duration = ?, filesize = ? WHERE id = ?",
-                            (duration_seconds, file_size, recording_id),
+                            """UPDATE recordings
+                               SET duration = ?, filesize = ?,
+                                   updated_at = MAX(updated_at + 1, ?)
+                               WHERE id = ?""",
+                            (
+                                duration_seconds, file_size,
+                                time.time_ns() // 1_000_000, recording_id,
+                            ),
                         )
                         conn.commit()
                     except Exception as e:
@@ -1088,10 +1051,10 @@ def get_calendar_days(recordings):
     days = set()
     for recording in recordings:
         timestamp = recording.get('timestamp')
-        if timestamp and len(timestamp) >= 8:
+        if timestamp is not None:
             try:
-                days.add(int(timestamp[6:8]))
-            except (ValueError, IndexError):
+                days.add(datetime.fromtimestamp(timestamp / 1000, timezone.utc).day)
+            except (TypeError, ValueError, OSError):
                 pass
 
     return jsonify({'days': sorted(days)}), 200
@@ -1143,10 +1106,10 @@ def get_calendar_hours(recordings):
     hours = set()
     for recording in recordings:
         timestamp = recording.get('timestamp')
-        if timestamp and len(timestamp) >= 11:
+        if timestamp is not None:
             try:
-                hours.add(int(timestamp[9:11]))
-            except (ValueError, IndexError):
+                hours.add(datetime.fromtimestamp(timestamp / 1000, timezone.utc).hour)
+            except (TypeError, ValueError, OSError):
                 pass
 
     return jsonify({'hours': sorted(hours)}), 200

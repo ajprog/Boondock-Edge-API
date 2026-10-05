@@ -1,6 +1,7 @@
 """Consistent SQLite connections and low-noise slow-operation diagnostics."""
 
 import logging
+import json
 import os
 import sqlite3
 import threading
@@ -15,11 +16,28 @@ _wal_paths = set()
 _wal_lock = threading.Lock()
 
 
+def _convert_boolean(value: bytes) -> bool:
+    """Convert a SQLite BOOLEAN value to a Python bool."""
+    return value not in {b"0", b"false", b"False", b""}
+
+
+def _convert_json(value: bytes):
+    """Convert a SQLite JSON value to its Python representation."""
+    return json.loads(value.decode("utf-8"))
+
+
+sqlite3.register_converter("BOOLEAN", _convert_boolean)
+sqlite3.register_converter("JSON", _convert_json)
+sqlite3.register_adapter(dict, json.dumps)
+sqlite3.register_adapter(list, json.dumps)
+
+
 def connect_sqlite(
     path,
     *,
     timeout: float = 5.0,
     row_factory: bool = False,
+    typed: bool = False,
 ) -> sqlite3.Connection:
     """Open a consistently configured connection to a local SQLite database."""
     database_path = Path(path)
@@ -27,6 +45,7 @@ def connect_sqlite(
         database_path,
         timeout=timeout,
         check_same_thread=False,
+        detect_types=sqlite3.PARSE_DECLTYPES if typed else 0,
     )
     try:
         connection.execute(f"PRAGMA busy_timeout = {max(0, int(timeout * 1000))}")

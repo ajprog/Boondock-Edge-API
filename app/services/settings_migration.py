@@ -38,7 +38,6 @@ def migrate_json_to_sqlite():
         'frequencies.json': os.path.join(_DB_DIR, 'frequencies.json'),
         'channels.json': os.path.join(_DB_DIR, 'channels.json'),
         'tokens.json': os.path.join(_DB_DIR, 'tokens.json'),
-        'pagination_preferences.json': os.path.join(_DB_DIR, 'pagination_preferences.json'),
         'branding.json': os.path.join(_DB_DIR, 'branding.json'),
         'hallucinations.json': os.path.join(_DB_DIR, 'hallucinations.json'),
         'backup_history.json': os.path.join(_DB_DIR, 'backup_history.json'),
@@ -141,20 +140,6 @@ def migrate_json_to_sqlite():
             migrated_count += 1
         except Exception as e:
             logger.error(f"✗ Error migrating tokens.json: {e}")
-            error_count += 1
-    
-    # Migrate pagination_preferences.json
-    if os.path.exists(json_files['pagination_preferences.json']):
-        try:
-            with open(json_files['pagination_preferences.json'], 'r', encoding='utf-8') as f:
-                pagination_data = json.load(f)
-            if isinstance(pagination_data, dict):
-                for email, prefs in pagination_data.items():
-                    settings_manager.save_pagination_prefs(email, prefs)
-            logger.info("✓ Migrated pagination_preferences.json")
-            migrated_count += 1
-        except Exception as e:
-            logger.error(f"✗ Error migrating pagination_preferences.json: {e}")
             error_count += 1
     
     # Migrate branding.json
@@ -293,4 +278,3 @@ if __name__ == "__main__":
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
     migrate_json_to_sqlite()
-

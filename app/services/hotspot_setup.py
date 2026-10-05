@@ -28,13 +28,13 @@ DEFAULT_HOST_PORT = "4000"
 def _ensure_host_settings(settings_manager) -> Dict[str, str]:
     """Insert default host_* settings only when missing or empty."""
     settings = settings_manager.get_all_settings() or {}
-    ssid = (settings.get("host_ssid") or "").strip() or DEFAULT_HOTSPOT_SSID
+    ssid = (settings.get("ssid") or "").strip() or DEFAULT_HOTSPOT_SSID
     password = (settings.get("host_password") or "").strip() or DEFAULT_HOTSPOT_PASSWORD
     host_ip = (settings.get("host_ip") or "").strip() or DEFAULT_HOST_IP
     host_port = (settings.get("host_port") or "").strip() or DEFAULT_HOST_PORT
 
-    if not (settings.get("host_ssid") or "").strip():
-        settings_manager.set_setting("host_ssid", ssid)
+    if not (settings.get("ssid") or "").strip():
+        settings_manager.set_setting("ssid", ssid)
     if not (settings.get("host_password") or "").strip():
         settings_manager.set_setting("host_password", password)
     if not (settings.get("host_ip") or "").strip():

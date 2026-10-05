@@ -15,10 +15,16 @@ def test_transcription_update_uses_resolved_recording_path(
     database = tmp_path / "recordings.db"
     with sqlite3.connect(database) as connection:
         connection.execute(
-            "CREATE TABLE recordings (id INTEGER PRIMARY KEY, filename TEXT, transcription TEXT)"
+            """CREATE TABLE recordings (
+                id INTEGER PRIMARY KEY,
+                filename TEXT,
+                transcription TEXT,
+                is_hallucination BOOLEAN NOT NULL DEFAULT FALSE,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            )"""
         )
         connection.execute(
-            "INSERT INTO recordings VALUES (?, ?, ?)",
+            "INSERT INTO recordings (id, filename, transcription) VALUES (?, ?, ?)",
             (1, "recordings/sample.wav", "old text"),
         )
 
@@ -41,6 +47,9 @@ def test_transcription_update_uses_resolved_recording_path(
 
     assert response.status_code == 200
     with sqlite3.connect(database) as connection:
-        assert connection.execute(
-            "SELECT transcription FROM recordings WHERE id = 1"
-        ).fetchone() == ("corrected text",)
+        row = connection.execute(
+            """SELECT transcription, is_hallucination, updated_at
+               FROM recordings WHERE id = 1"""
+        ).fetchone()
+        assert row[:2] == ("corrected text", 0)
+        assert row[2] > 0

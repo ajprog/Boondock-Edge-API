@@ -14,14 +14,15 @@ def _insert_recording(
     timestamp=None,
     transcription="transcript",
     is_duplicate=0,
+    updated_at=1,
 ):
     with sqlite3.connect(db_path) as conn:
         conn.execute(
             """
             INSERT INTO recordings (
                 id, channel_id, filename, timestamp, transcription,
-                status, is_duplicate, duration, filesize
-            ) VALUES (?, ?, ?, ?, ?, 'new', ?, 1.5, 100)
+                status, is_duplicate, duration, filesize, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'new', ?, 1.5, 100, ?)
             """,
             (
                 recording_id,
@@ -30,6 +31,7 @@ def _insert_recording(
                 timestamp,
                 transcription,
                 is_duplicate,
+                updated_at,
             ),
         )
 
@@ -63,45 +65,84 @@ def test_recordings_route_reads_real_recordings_database(
         db_path,
         7,
         "recordings/device/audio.wav",
-        timestamp="20260818_120000",
+        timestamp=1787054400000,
     )
 
     from app import create_app
 
     response = create_app().test_client().get("/api/recordings", headers=admin_auth)
 
-    assert response.status_code == 200
-    body = response.get_json()
-    assert [recording["id"] for recording in body] == [7]
-    assert body[0]["filename"] == "recordings/device/audio.wav"
+    assert response.status_code == 404
 
 
 def test_recordings_inbox_applies_real_query_filters(
     recording_store, admin_auth
 ):
     db_path, _ = recording_store
-    _insert_recording(db_path, 1, "recordings/1.wav", timestamp="20260818_120000")
-    _insert_recording(db_path, 2, "recordings/2.wav", timestamp="20260818_130000")
-    _insert_recording(db_path, 3, "recordings/3.wav", timestamp="20260818_140000")
+    _insert_recording(db_path, 1, "recordings/1.wav", timestamp=1787054400000)
+    _insert_recording(db_path, 2, "recordings/2.wav", timestamp=1787058000000)
+    _insert_recording(db_path, 3, "recordings/3.wav", timestamp=1787061600000)
 
     from app import create_app
 
     client = create_app().test_client()
     response = client.get(
-        "/api/recordings/inbox?limit=1&since_timestamp=20260818_120000",
+        "/api/recordings/inbox?limit=1&start_at=1787054400000",
         headers=admin_auth,
     )
 
     assert response.status_code == 200
     body = response.get_json()
-    assert [recording["id"] for recording in body["recordings"]] == [3]
+    assert [recording["id"] for recording in body["messages"]] == [3]
     assert body["meta"] == {
-        "limit": 1,
-        "returned": 1,
+        "total": 3,
         "has_more": True,
-        "next_before_timestamp": "20260818_140000",
+        "next_before_timestamp": 1787061600000,
         "next_before_id": 3,
+        "next_offset": None,
     }
+
+    older = client.get(
+        "/api/recordings/inbox?limit=1&before_timestamp=1787061600000&before_id=3",
+        headers=admin_auth,
+    )
+    assert older.status_code == 200
+    assert [message["id"] for message in older.get_json()["messages"]] == [2]
+
+
+def test_recordings_inbox_poll_uses_updated_boundary_and_offset(
+    recording_store, admin_auth
+):
+    db_path, _ = recording_store
+    _insert_recording(db_path, 1, "recordings/1.wav", timestamp=1000, updated_at=5000)
+    _insert_recording(db_path, 2, "recordings/2.wav", timestamp=2000, updated_at=5001)
+
+    from app import create_app
+
+    client = create_app().test_client()
+    first = client.get(
+        "/api/recordings/inbox?updated_since=5000&limit=1", headers=admin_auth
+    )
+    assert first.status_code == 200
+    assert [message["id"] for message in first.get_json()["messages"]] == [1]
+    assert first.get_json()["meta"]["next_offset"] == 1
+
+    second = client.get(
+        "/api/recordings/inbox?updated_since=5000&limit=1&offset=1",
+        headers=admin_auth,
+    )
+    assert [message["id"] for message in second.get_json()["messages"]] == [2]
+
+
+def test_removed_recording_collection_routes_are_not_available(
+    recording_store, admin_auth
+):
+    from app import create_app
+
+    client = create_app().test_client()
+    assert client.get('/api/recordings', headers=admin_auth).status_code == 404
+    assert client.get('/api/recordings/inbox/range', headers=admin_auth).status_code == 404
+    assert client.get('/api/recordings/inbox/count', headers=admin_auth).status_code == 404
 
 
 def test_serve_audio_returns_existing_file(recording_store, admin_auth):
@@ -113,7 +154,7 @@ def test_serve_audio_returns_existing_file(recording_store, admin_auth):
         db_path,
         1,
         "recordings/device/audio.wav",
-        timestamp="20260818_120000",
+        timestamp=1787054400000,
     )
 
     from app import create_app

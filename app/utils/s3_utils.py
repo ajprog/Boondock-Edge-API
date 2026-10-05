@@ -21,7 +21,7 @@ def get_s3_settings():
             'aws_secret_access_key': settings.get('s3_secret_key', os.environ.get('S3_SECRET_KEY', '')),
             'region_name': settings.get('s3_region', os.environ.get('S3_REGION', 'us-east-1')),
             'bucket_name': settings.get('s3_bucket_name', os.environ.get('S3_BUCKET_NAME', '')),
-            'enabled': settings.get('global_enable_s3_upload', False)
+            'enabled': settings.get('s3_enabled', False)
         }
     except Exception as e:
         log.warning(f"Error loading S3 settings from database: {e}, using environment variables")

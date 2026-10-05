@@ -8,7 +8,11 @@ import sqlite3
 import json
 from config import Config, DATA_ROOT
 from ..utils.logging_setup import error_logger, warning_logger, transcription_logger, db_logger
-from .transcription_service import TranscriptionService
+from .transcription_service import (
+    TranscriptionAuthenticationError,
+    TranscriptionService,
+)
+from .recording_state import is_hallucination, update_transcription
 from .settings_manager import get_settings_manager
 
 _settings_manager = get_settings_manager()
@@ -102,12 +106,12 @@ class AudioChannel:
         db_logger.info(f"AudioChannel {channel_id} initialized successfully")
 
     def save_recording(self, filename, timestamp, transcription):
-        """Save recording metadata to database with improved error handling and validation."""
+        """Store one successfully returned transcription and its classification."""
         with self.recording_lock:
             conn = sqlite3.connect(_get_db_path(), isolation_level='IMMEDIATE')
             cursor = None
             try:
-                if not all([filename, timestamp, transcription]):
+                if not filename or not timestamp or not isinstance(transcription, str):
                     raise ValueError("Missing required fields for recording")
                     
                 cursor = conn.cursor()
@@ -119,12 +123,7 @@ class AudioChannel:
                 
                 existing = cursor.fetchone()
                 if existing:
-                    # Update existing record - only update transcription, preserve filesize/duration
-                    cursor.execute('''
-                        UPDATE recordings 
-                        SET  transcription = ?
-                        WHERE channel_id = ? AND filename = ?
-                    ''', (transcription, self.channel_id, filename))
+                    update_transcription(conn, existing[0], transcription)
                 else:
                     # Insert new record - calculate filesize and duration
                     file_path = (DATA_ROOT / filename).resolve()
@@ -143,9 +142,15 @@ class AudioChannel:
                             duration = round(num_samples / SAMPLE_RATE, 1)
                     
                     cursor.execute('''
-                        INSERT INTO recordings (channel_id, filename, timestamp, transcription, filesize, duration)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (self.channel_id, filename, timestamp, transcription, file_size, duration))
+                        INSERT INTO recordings (
+                            channel_id, filename, timestamp, transcription, filesize,
+                            duration, is_hallucination, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        self.channel_id, filename, timestamp, transcription,
+                        file_size, duration, is_hallucination(transcription),
+                        time.time_ns() // 1_000_000,
+                    ))
                 
                 conn.commit()
                 db_logger.info(f"Recording saved successfully: Channel {self.channel_id}, File: {filename}")
@@ -225,6 +230,7 @@ class MultiChannelAudioHandler:
             self.upload_processor_thread = None
             self.upload_processor_lock = threading.Lock()
             self._pending_filenames_in_queue = set()  # filenames we've put in queue and not yet got (avoids duplicate put)
+            self.queue_error = None
             self.channels = {}  # Dictionary to store channels dynamically
             # One authoritative timeout for watchdog and transcription-loop checks.
             self.processing_timeout_seconds = 120
@@ -283,9 +289,9 @@ class MultiChannelAudioHandler:
             cursor = conn.cursor()
             cursor.execute('''
                 UPDATE recordings 
-                SET status = ?
+                SET status = ?, updated_at = MAX(updated_at + 1, ?)
                 WHERE filename = ?
-            ''', (status, filename))
+            ''', (status, time.time_ns() // 1_000_000, filename))
             conn.commit()
             conn.close()
         except Exception as e:
@@ -304,6 +310,7 @@ class MultiChannelAudioHandler:
                     'is_running': self.running,
                     'queue_size': self.upload_queue.qsize(),
                     'total_tasks': len(tasks_dict),
+                    'queue_error': self.queue_error,
                     'tasks': tasks_dict,
                 }
                 tmp_path = CURRENT_QUEUE_JSON.with_name(CURRENT_QUEUE_JSON.name + ".tmp")
@@ -352,6 +359,7 @@ class MultiChannelAudioHandler:
             with open(CURRENT_QUEUE_JSON, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             tasks_data = data.get('tasks', {})
+            self.queue_error = data.get('queue_error')
             if not tasks_data:
                 return
             with self.upload_processor_lock:
@@ -388,7 +396,9 @@ class MultiChannelAudioHandler:
 
     def start(self):
         """Start upload processing."""
+        self.queue_error = None
         self.running = True
+        self._save_current_queue()
         self.upload_processor_thread = threading.Thread(
             target=self.process_upload_queue,
             daemon=True
@@ -409,9 +419,7 @@ class MultiChannelAudioHandler:
             tuple: (success: bool, message: str)
         """
         try:
-            channel_id = None
             file_path = None
-            timestamp = None
             
             with self.upload_processor_lock:
                 if filename not in self.upload_tasks:
@@ -430,20 +438,11 @@ class MultiChannelAudioHandler:
                 task.completed_at = datetime.now(timezone.utc).isoformat()
                 
                 # Capture task attributes
-                channel_id = task.channel_id
                 file_path = task.file_path
-                timestamp = task.timestamp
             
             # Update database outside lock
             if file_path:
                 self._update_recording_status(file_path, 'failed')
-                
-                # Save "...." to database on kill
-                try:
-                    channel = self.get_or_create_channel(channel_id)
-                    channel.save_recording(file_path, timestamp, "....")
-                except Exception as db_error:
-                    error_logger.error(f"Error saving killed task to database: {str(db_error)}")
                 
                 transcription_logger.info(f"Killed task {filename} - queue can now process next task")
                 self._move_task_to_history_and_remove_from_current(filename, 'killed')
@@ -623,7 +622,7 @@ class MultiChannelAudioHandler:
         """Queue an uploaded file for processing."""
         queue_started_at = time.perf_counter()
         try:
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
             task = UploadTask(file_path, channel_id, timestamp, is_duplicate=is_duplicate)
 
             filename = os.path.basename(file_path)
@@ -662,9 +661,7 @@ class MultiChannelAudioHandler:
             
             # Mark stuck tasks as failed (outside lock to avoid deadlock)
             for filename, task in stuck_tasks:
-                channel_id = None
                 file_path = None
-                timestamp = None
                 
                 with self.upload_processor_lock:
                     # Double-check status hasn't changed
@@ -674,20 +671,11 @@ class MultiChannelAudioHandler:
                         task.error = f"Processing timeout after {self.processing_timeout_seconds} seconds"
                         task.processing_started_at = None
                         # Capture task attributes before releasing lock
-                        channel_id = task.channel_id
                         file_path = task.file_path
-                        timestamp = task.timestamp
                 
                 # Update database outside lock
                 if file_path:
                     self._update_recording_status(file_path, 'failed')
-                    
-                    # Save "...." to database on timeout failure
-                    try:
-                        channel = self.get_or_create_channel(channel_id)
-                        channel.save_recording(file_path, timestamp, "....")
-                    except Exception as db_error:
-                        error_logger.error(f"Error saving timeout failure to database: {str(db_error)}")
                     
                     transcription_logger.info(f"Marked stuck task {filename} as failed due to timeout")
                     self._move_task_to_history_and_remove_from_current(filename, 'failed')
@@ -715,9 +703,7 @@ class MultiChannelAudioHandler:
                             stuck_tasks.append((filename, task))
 
             for filename, task in stuck_tasks:
-                channel_id = None
                 file_path = None
-                timestamp = None
                 with self.upload_processor_lock:
                     if task.status == "processing" and task.processing_started_at:
                         error_logger.warning(
@@ -726,18 +712,11 @@ class MultiChannelAudioHandler:
                         task.status = "failed"
                         task.error = f"Processing stuck for more than {self.processing_timeout_seconds} seconds - queue restarted"
                         task.processing_started_at = None
-                        channel_id = task.channel_id
                         file_path = task.file_path
-                        timestamp = task.timestamp
                         marked_count += 1
 
                 if file_path:
                     self._update_recording_status(file_path, 'failed')
-                    try:
-                        channel = self.get_or_create_channel(channel_id)
-                        channel.save_recording(file_path, timestamp, "....")
-                    except Exception as db_error:
-                        error_logger.error(f"Error saving long-stuck task to database: {str(db_error)}")
                     transcription_logger.info(f"Marked long-stuck task {filename} as failed (2 min cycle)")
                     self._move_task_to_history_and_remove_from_current(filename, 'failed')
 
@@ -821,8 +800,6 @@ class MultiChannelAudioHandler:
                         # Skip transcription if file is a duplicate
                         if task.is_duplicate:
                             transcription_logger.info(f"Skipping transcription for duplicate file: {task.file_path} (is_duplicate=True)")
-                            # Still save the recording but with placeholder transcription and marked as duplicate
-                            channel.save_recording(task.file_path, task.timestamp, 'Duplicate file - not transcribed')
                             # Update status in database
                             self._update_recording_status(task.file_path, 'skipped')
                             task.status = "completed"
@@ -830,8 +807,6 @@ class MultiChannelAudioHandler:
                             task.processing_started_at = None
                         elif not auto_transcribe_enabled:
                             transcription_logger.info(f"Skipping transcription for channel {task.channel_id} (auto_transcribe disabled)")
-                            # Still save the recording but with placeholder transcription
-                            channel.save_recording(task.file_path, task.timestamp, 'No transcription available')
                             # Update status in database
                             self._update_recording_status(task.file_path, 'skipped')
                             task.status = "completed"
@@ -877,10 +852,6 @@ class MultiChannelAudioHandler:
                                         task.error = f"Processing stuck for more than {self.processing_timeout_seconds} seconds - queue restarted"
                                         task.processing_started_at = None
                                     self._update_recording_status(task.file_path, 'failed')
-                                    try:
-                                        channel.save_recording(task.file_path, task.timestamp, "....")
-                                    except Exception as db_error:
-                                        error_logger.error(f"Error saving long-stuck task to database: {str(db_error)}")
                                     transcription_logger.info("2 min cycle: marked long-stuck task as failed, re-queuing pending for unprocessed")
                                     self._requeue_stuck_pending_tasks()
                                     break
@@ -902,21 +873,41 @@ class MultiChannelAudioHandler:
                                 
                                 transcription_logger.debug(f"Transcription completed for uploaded file: {task.file_path}")
                                 
-                                if transcription:
-                                    channel.save_recording(task.file_path, task.timestamp, transcription)
-                                    # Update status in database
-                                    self._update_recording_status(task.file_path, 'transcribed')
-                                    task.status = "completed"
-                                    task.transcription = transcription
-                                    task.processing_started_at = None
-                                    task.completed_at = datetime.now(timezone.utc).isoformat()
-                                else:
-                                    raise Exception("Transcription failed - no result returned")
+                                if not isinstance(transcription, str):
+                                    raise RuntimeError("Transcription did not return text")
+                                if not channel.save_recording(
+                                    task.file_path, task.timestamp, transcription
+                                ):
+                                    raise RuntimeError("Failed to save transcription")
+                                self._update_recording_status(task.file_path, 'transcribed')
+                                task.status = "completed"
+                                task.transcription = transcription
+                                task.processing_started_at = None
+                                task.completed_at = datetime.now(timezone.utc).isoformat()
                             except Exception as trans_error:
                                 # Check if task was already marked as failed due to timeout
                                 if task.status != "failed":
                                     raise trans_error
                             
+                    except TranscriptionAuthenticationError as error:
+                        error_logger.error(
+                            "Stopping transcription queue: %s", error
+                        )
+                        with self.upload_processor_lock:
+                            task.status = 'pending'
+                            task.error = str(error)
+                            task.processing_started_at = None
+                            self.running = False
+                            self.queue_error = {
+                                'type': 'authentication',
+                                'message': str(error),
+                            }
+                            self.upload_queue.put(task)
+                            self._pending_filenames_in_queue.add(task.file_path)
+                        self._update_recording_status(task.file_path, 'pending')
+                        _settings_manager.set_setting(
+                            'transcription_queue_enabled', False
+                        )
                     except Exception as e:
                         error_logger.error(f"Error processing upload: {str(e)}")
                         # Only update if not already failed due to timeout
@@ -925,12 +916,6 @@ class MultiChannelAudioHandler:
                             self._update_recording_status(task.file_path, 'failed')
                             task.status = "failed"
                             task.error = str(e)
-                            # Save "...." to database only on failure
-                            if channel is not None:
-                                try:
-                                    channel.save_recording(task.file_path, task.timestamp, "....")
-                                except Exception as db_error:
-                                    error_logger.error(f"Error saving failure status to database: {str(db_error)}")
                         task.processing_started_at = None
                     
                     finally:
@@ -1110,6 +1095,7 @@ class MultiChannelAudioHandler:
             'completed': completed_count,
             'failed': failed_count,
             'is_running': is_running,
+            'queue_error': current_data.get('queue_error') or self.queue_error,
             'tasks': paginated_tasks,
             'pagination': {
                 'page': page,
@@ -1150,6 +1136,7 @@ class MultiChannelAudioHandler:
             'completed': completed_count,
             'failed': failed_count,
             'is_running': is_running,
+            'queue_error': current_data.get('queue_error') or self.queue_error,
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'source': 'current_queue.json + queue_history.json',
         }
@@ -1159,6 +1146,7 @@ class MultiChannelAudioHandler:
         """Stop the transcription queue processor only (so user can stop/start from UI). Processor thread will exit on next loop check."""
         try:
             self.running = False
+            self.queue_error = None
             self._save_current_queue()
             db_logger.info("Transcription queue stopped by user")
         except Exception as e:
@@ -1178,18 +1166,15 @@ class MultiChannelAudioHandler:
             error_logger.error(f"Error stopping MultiChannelAudioHandler: {str(e)}")
 
     def get_all_recordings(self):
-        """Get all recordings across all channels, considering settings."""
-        settings = _settings_manager.get_all_settings()
-        
-        global_hallucination = settings.get("global_hallucination", False)
-        show_duplicates = settings.get("global_show_duplicate_files", False)
-        
+        """Get all recordings across all channels without preference filtering."""
         with self.db_lock:
             conn = sqlite3.connect(_get_db_path())
             try:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT id, channel_id, filename, timestamp, transcription, status, is_duplicate, duration, filesize
+                    SELECT id, channel_id, filename, timestamp, transcription,
+                           status, is_duplicate, duration, filesize,
+                           is_hallucination, updated_at
                     FROM recordings
                     ORDER BY timestamp DESC
                 ''')
@@ -1202,14 +1187,6 @@ class MultiChannelAudioHandler:
                     duration = row[7] if len(row) > 7 else None
                     filesize = row[8] if len(row) > 8 else None
                     
-                    # Skip duplicates if setting is disabled
-                    if not show_duplicates and is_duplicate:
-                        continue
-                    
-                    # Skip hallucinated transcriptions if setting is enabled
-                    if global_hallucination and transcription in ("...", "."):
-                        continue
-                    
                     filtered_recordings.append({
                         'id': row[0],
                         'channel_id': row[1],
@@ -1219,7 +1196,9 @@ class MultiChannelAudioHandler:
                         'transcription': transcription,
                         'is_duplicate': bool(is_duplicate),
                         'duration': duration,
-                        'filesize': filesize
+                        'filesize': filesize,
+                        'is_hallucination': bool(row[9]),
+                        'updated_at': row[10],
                     })
                 
                 return filtered_recordings
@@ -1227,172 +1206,6 @@ class MultiChannelAudioHandler:
             except sqlite3.Error as e:
                 error_logger.error(f"Error retrieving all recordings: {str(e)}")
                 return []
-            finally:
-                conn.close()
-
-    def get_recordings_inbox_window(self, limit=1000, since_timestamp=None, before_timestamp=None, before_id=None):
-        """
-        Return recordings for inbox views using bounded, index-friendly queries.
-
-        Args:
-            limit (int): max rows to return (clamped to 1..5000; invalid values default to 1000).
-            since_timestamp (str|None): lower bound (inclusive), format YYYYMMDD_HHMMSS
-            before_timestamp (str|None): keyset upper bound (exclusive), format YYYYMMDD_HHMMSS
-            before_id (int|None): tie-breaker for identical timestamps when before_timestamp is provided
-        """
-        settings = _settings_manager.get_all_settings()
-        global_hallucination = settings.get("global_hallucination", False)
-        show_duplicates = settings.get("global_show_duplicate_files", False)
-
-        try:
-            requested_limit = int(limit)
-        except (TypeError, ValueError):
-            requested_limit = 1000
-        requested_limit = max(1, min(requested_limit, 5000))
-
-        query_limit = requested_limit + 1  # fetch one extra row to compute has_more
-
-        where_clauses = []
-        params = []
-
-        if not show_duplicates:
-            where_clauses.append("is_duplicate = 0")
-
-        if global_hallucination:
-            where_clauses.append("transcription NOT IN ('...', '.')")
-
-        if since_timestamp:
-            where_clauses.append("timestamp >= ?")
-            params.append(since_timestamp)
-
-        if before_timestamp:
-            if before_id is not None:
-                where_clauses.append("(timestamp < ? OR (timestamp = ? AND id < ?))")
-                params.extend([before_timestamp, before_timestamp, before_id])
-            else:
-                where_clauses.append("timestamp < ?")
-                params.append(before_timestamp)
-
-        where_sql = ""
-        if where_clauses:
-            where_sql = " WHERE " + " AND ".join(where_clauses)
-
-        query = f"""
-            SELECT id, channel_id, filename, timestamp, transcription, status, is_duplicate, duration, filesize
-            FROM recordings
-            {where_sql}
-            ORDER BY timestamp DESC, id DESC
-            LIMIT ?
-        """
-        params.append(query_limit)
-
-        with self.db_lock:
-            conn = sqlite3.connect(_get_db_path())
-            try:
-                cursor = conn.cursor()
-                cursor.execute(query, params)
-                rows = cursor.fetchall()
-
-                has_more = len(rows) > requested_limit
-                rows = rows[:requested_limit]
-
-                recordings = []
-                for row in rows:
-                    recordings.append({
-                        'id': row[0],
-                        'channel_id': row[1],
-                        'filename': row[2],
-                        'timestamp': row[3],
-                        'status': row[5],
-                        'transcription': row[4],
-                        'is_duplicate': bool(row[6]),
-                        'duration': row[7] if len(row) > 7 else None,
-                        'filesize': row[8] if len(row) > 8 else None
-                    })
-
-                next_before_timestamp = None
-                next_before_id = None
-                if rows:
-                    last = rows[-1]
-                    next_before_timestamp = last[3]
-                    next_before_id = last[0]
-
-                return {
-                    'recordings': recordings,
-                    'meta': {
-                        'limit': requested_limit,
-                        'returned': len(recordings),
-                        'has_more': has_more,
-                        'next_before_timestamp': next_before_timestamp,
-                        'next_before_id': next_before_id,
-                    }
-                }
-            except sqlite3.Error as e:
-                error_logger.error(f"Error retrieving inbox recordings window: {str(e)}")
-                return {
-                    'recordings': [],
-                    'meta': {
-                        'limit': requested_limit,
-                        'returned': 0,
-                        'has_more': False,
-                        'next_before_timestamp': None,
-                        'next_before_id': None,
-                        'error': str(e),
-                    }
-                }
-            finally:
-                conn.close()
-
-    def get_recordings_inbox_count(self, since_timestamp=None, before_timestamp=None, before_id=None):
-        """
-        Return the total number of inbox rows that match the given window/filters.
-
-        Mirrors the WHERE clause of get_recordings_inbox_window() so the dashboard footer can
-        show the real total instead of "of <loaded so far>". This is a lightweight COUNT(*)
-        and is safe to call after a chunk load or when the View time range changes.
-        """
-        settings = _settings_manager.get_all_settings()
-        global_hallucination = settings.get("global_hallucination", False)
-        show_duplicates = settings.get("global_show_duplicate_files", False)
-
-        where_clauses = []
-        params = []
-
-        if not show_duplicates:
-            where_clauses.append("is_duplicate = 0")
-
-        if global_hallucination:
-            where_clauses.append("transcription NOT IN ('...', '.')")
-
-        if since_timestamp:
-            where_clauses.append("timestamp >= ?")
-            params.append(since_timestamp)
-
-        if before_timestamp:
-            if before_id is not None:
-                where_clauses.append("(timestamp < ? OR (timestamp = ? AND id < ?))")
-                params.extend([before_timestamp, before_timestamp, before_id])
-            else:
-                where_clauses.append("timestamp < ?")
-                params.append(before_timestamp)
-
-        where_sql = ""
-        if where_clauses:
-            where_sql = " WHERE " + " AND ".join(where_clauses)
-
-        query = f"SELECT COUNT(*) FROM recordings{where_sql}"
-
-        with self.db_lock:
-            conn = sqlite3.connect(_get_db_path())
-            try:
-                cursor = conn.cursor()
-                cursor.execute(query, params)
-                row = cursor.fetchone()
-                total = int(row[0]) if row and row[0] is not None else 0
-                return {'total': total}
-            except sqlite3.Error as e:
-                error_logger.error(f"Error counting inbox recordings: {str(e)}")
-                return {'total': 0, 'error': str(e)}
             finally:
                 conn.close()
 
@@ -1423,8 +1236,8 @@ def get_audio_handler():
 def _create_audio_handler():
     """Internal factory — must be called while holding _audio_handler_lock."""
     settings = load_settings()
-    model_name = settings.get("global_model", "small")
-    transcribe_method = settings.get("global_transcribe_method", "local")
+    model_name = settings.get("model", "small")
+    transcribe_method = settings.get("method", "local")
     if transcribe_method not in {"local", "openai"}:
         transcribe_method = "local"
 
@@ -1452,7 +1265,7 @@ def reload_transcription_settings():
             return
 
         settings = load_settings()
-        method = settings.get("global_transcribe_method", "local")
+        method = settings.get("method", "local")
         _audio_handler.transcribe_method = method if method in {"local", "openai"} else "local"
 
         db_logger.info(

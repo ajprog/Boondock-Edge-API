@@ -26,7 +26,7 @@ def get_maintenance_time():
     """Get maintenance time from settings, default to 3:00 AM."""
     try:
         settings = _settings_manager.get_all_settings()
-        maintenance_time_str = settings.get('maintenance_time', '03:00')
+        maintenance_time_str = settings.get('scheduled_time', '03:00')
         # Parse time string (HH:MM format)
         try:
             hour, minute = map(int, maintenance_time_str.split(':'))
@@ -45,7 +45,7 @@ def get_enabled_maintenance_tasks():
     try:
         settings = _settings_manager.get_all_settings()
         # Get enabled tasks (default: all enabled)
-        enabled_tasks = settings.get('maintenance_enabled_tasks', [
+        enabled_tasks = settings.get('enabled_tasks', [
             TASK_ID_BACKUP,
             TASK_ID_LOGS_CLEANUP,
             TASK_ID_HEALTH_CHECKS
@@ -137,4 +137,3 @@ def restart_scheduler():
     """Restart the scheduler (useful when maintenance time or enabled tasks change)."""
     stop_scheduler()
     start_scheduler()
-

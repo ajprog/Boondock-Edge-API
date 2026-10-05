@@ -11,6 +11,12 @@ from ..middleware.auth_middleware import require_permission
 from ..utils.logging_setup import error_logger, event_logger
 from ..services.settings_manager import get_settings_manager
 from ..services.channel_state import load_owned_channels, load_request_channel, load_owned_recordings
+from ..services.channel_recorder_sync import (
+    export_channel_configuration,
+    find_connected_recorder,
+    import_recorder_configuration,
+    present_channel,
+)
 
 _settings_manager = get_settings_manager()
 
@@ -37,10 +43,13 @@ def get_channels(channels_data):
         channel.setdefault('src_language', 'english')  # Default language
         channel.setdefault('auto_transcribe', True)  # Default to enabled for auto-transcription
 
-    return jsonify(active_channels)
+    return jsonify([
+        present_channel(channel, find_connected_recorder(channel.get('mac')))
+        for channel in active_channels
+    ])
 
 
-@channels_bp.route('/channel/<int:channel_id>/recordings')
+@channels_bp.route('/channels/<int:channel_id>/recordings')
 @require_permission(
     ['recording.read'], loader=load_owned_recordings,
     id_argument='channel_id', inject_as='recordings'
@@ -65,7 +74,7 @@ def get_channel_recordings(channel_id, recordings):
     return jsonify(recordings)
 
 
-@channels_bp.route('/channel/<int:channel_id>', methods=['GET'])
+@channels_bp.route('/channels/<int:channel_id>', methods=['GET'])
 @require_permission(
     ['channel.read'], loader=load_request_channel,
     id_argument='channel_id', inject_as='channel'
@@ -89,16 +98,28 @@ def get_channel_recordings(channel_id, recordings):
 })
 def get_channel(channel_id, channel):
     """Get details for a specific channel."""
-    return jsonify(channel)
+    recorder = find_connected_recorder(channel.get('mac'))
+    device_sync = {'attempted': recorder is not None, 'success': None, 'error': None}
+    if recorder is not None:
+        try:
+            channel = import_recorder_configuration(channel, recorder)
+            device_sync['success'] = True
+        except Exception as exc:
+            logging.exception('Unable to synchronize recorder for channel %s', channel_id)
+            device_sync.update(success=False, error=str(exc))
+    response = present_channel(channel, recorder)
+    response['device_sync'] = device_sync
+    return jsonify(response)
 
-@channels_bp.route('/channel/<int:channel_id>', methods=['PUT'])
+
+@channels_bp.route('/channels/<int:channel_id>', methods=['PATCH'])
 @require_permission(
     ['channel.update'], loader=load_request_channel,
     id_argument='channel_id', inject_as='channel'
 )
 @swag_from({
     'tags': ['Channels'],
-    'summary': 'Update channel configuration',
+    'summary': 'Partially update channel configuration',
     'parameters': [
         {
             'name': 'channel_id',
@@ -210,20 +231,39 @@ def update_channel(channel_id, channel):
         'src_language', 'target_language', 'threshold', 'silence', 'min_rec',
         'max_rec', 'audio_gain', 'driver', 'mac', 'person', 'tag', 'car',
         'frequency', 'tone', 'type', 'audio_stream_enabled', 'audio_stream_port', 
-        'auto_transcribe', 'speaker_enabled', 'speaker_volume'
+        'auto_transcribe', 'speaker_enabled', 'speaker_volume',
+        'device_hostname', 'device_ip'
     ]
 
     for field in fields_to_update:
         if field in data:
             channel[field] = data[field]
 
-    # Save updated channel using SettingsManager
-    _settings_manager.save_channel(channel)
+    try:
+        saved_id = _settings_manager.save_channel(channel)
+        if saved_id == -1:
+            raise RuntimeError('Channel database update failed')
+    except Exception as exc:
+        error_logger.error('Failed to update channel %s: %s', channel_id, exc)
+        return jsonify({'error': f'Failed to update channel: {exc}'}), 500
 
-    return jsonify({'message': 'Channel updated successfully'}), 200
+    recorder = find_connected_recorder(channel.get('mac'))
+    device_sync = {'attempted': recorder is not None, 'success': None, 'error': None}
+    if recorder is not None:
+        try:
+            export_channel_configuration(channel, recorder)
+            device_sync['success'] = True
+        except Exception as exc:
+            logging.exception('Channel %s saved, but recorder synchronization failed', channel_id)
+            device_sync.update(success=False, error=str(exc))
+
+    return jsonify({
+        'channel': present_channel(_settings_manager.get_channel(channel_id), recorder),
+        'device_sync': device_sync,
+    }), 200
 
 
-@channels_bp.route('/channel/<int:channel_id>', methods=['DELETE'])
+@channels_bp.route('/channels/<int:channel_id>', methods=['DELETE'])
 @require_permission(
     ['channel.delete'], loader=load_request_channel,
     id_argument='channel_id', inject_as='channel'
@@ -267,7 +307,7 @@ def delete_channel(channel_id, channel):
         return jsonify({'error': f'Failed to delete channel: {str(e)}'}), 500
 
 
-@channels_bp.route('/channel', methods=['POST'])
+@channels_bp.route('/channels', methods=['POST'])
 @require_permission(['channel.create'])
 @swag_from({
     'tags': ['Channels'],

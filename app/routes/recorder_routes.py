@@ -14,7 +14,7 @@ from werkzeug.utils import secure_filename
 
 from flask import Blueprint, jsonify, request
 from ..middleware.auth_middleware import require_admin
-from serial import Serial, SerialException, SerialTimeoutException
+from serial import Serial, SerialException
 import serial.tools.list_ports
 from app.services.recorder_monitor import (
     start_monitoring_for_device,
@@ -32,6 +32,10 @@ from app.services.recorder_monitor import (
     get_port_mac_map,
     load_reboot_history,
     sync_reboot_counts_from_logs,
+)
+from app.services.recorder_config_transport import (
+    read_recorder_config as read_recorder_config_from_device,
+    write_recorder_config as write_recorder_config_to_device,
 )
 
 recorders_bp = Blueprint('recorders', __name__)
@@ -152,7 +156,7 @@ def _store_config(port, config):
 def _settings_allow_discovery():
     try:
         settings = _settings_manager.get_all_settings()
-        return settings.get('global_enable_edge_devices', False)
+        return settings.get('edge_recorders_enabled', False)
     except Exception as e:
         _logger.error(f"Unable to get settings while checking recorder discovery flag: {e}")
         return False
@@ -249,76 +253,6 @@ def _terminal_session_active(port):
     with _terminal_sessions_lock:
         session = _terminal_sessions.get(port)
         return bool(session and session._active)
-
-
-def _extract_json_candidate(text):
-    start = text.find('{')
-    end = text.rfind('}')
-    if start == -1 or end == -1 or end <= start:
-        return None
-    return text[start:end + 1]
-
-
-def _read_config_from_device(port, timeout_seconds=8.0):
-    try:
-        with Serial(port=port, baudrate=115200, timeout=0.2, write_timeout=1) as connection:
-            try:
-                connection.reset_input_buffer()
-                connection.reset_output_buffer()
-            except (SerialException, AttributeError):
-                pass
-
-            connection.write(b'READCONFIG\n')
-            connection.flush()
-
-            deadline = time.time() + timeout_seconds
-            buffer = bytearray()
-
-            while time.time() < deadline:
-                chunk = connection.read(4096)
-                if chunk:
-                    buffer.extend(chunk)
-                    text = buffer.decode('utf-8', errors='ignore')
-                    candidate = _extract_json_candidate(text)
-                    if candidate:
-                        try:
-                            config = json.loads(candidate)
-                            return config
-                        except json.JSONDecodeError:
-                            continue
-                else:
-                    time.sleep(0.05)
-
-            raise TimeoutError('Recorder did not return configuration before timeout.')
-    except SerialTimeoutException as exc:
-        raise TimeoutError('Timed out waiting for configuration response.') from exc
-
-
-def _write_config_to_device(port, config):
-    config_payload = json.dumps(config, separators=(',', ':'), ensure_ascii=True)
-
-    with Serial(port=port, baudrate=115200, timeout=1, write_timeout=1) as connection:
-        try:
-            connection.reset_input_buffer()
-            connection.reset_output_buffer()
-        except (SerialException, AttributeError):
-            pass
-
-        connection.write(b'WRITECONFIG\n')
-        connection.flush()
-        time.sleep(0.2)
-
-        connection.write(config_payload.encode('utf-8'))
-        connection.write(b'\n')
-        connection.flush()
-
-        time.sleep(5.0)
-
-        try:
-            connection.write(b'REBOOT\n')
-            connection.flush()
-        except SerialException as exc:
-            _logger.warning('Failed to send reboot command on %s: %s', port, exc)
 
 
 def _send_simple_command(port, command, wait_after=0.0):
@@ -599,7 +533,7 @@ def read_recorder_config():
         return jsonify({'message': f'Close the open terminal session for {port} before reading configuration.'}), 409
 
     try:
-        config = _read_config_from_device(port)
+        config = read_recorder_config_from_device(port)
     except FileNotFoundError:
         return jsonify({'message': f'Port {port} not found.'}), 404
     except TimeoutError as exc:
@@ -642,7 +576,7 @@ def write_recorder_config():
         _store_config(port, config)  # Keep disk copy in sync with override
 
     try:
-        _write_config_to_device(port, config)
+        write_recorder_config_to_device(port, config)
     except FileNotFoundError:
         return jsonify({'message': f'Port {port} not found.'}), 404
     except TimeoutError as exc:
@@ -1697,7 +1631,7 @@ def send_autoconfig():
     #         'message': 'host_ssid, host_password, host_ip, and host_port (1-65535) are required.'
     #     }), 400
     settings = _settings_manager.get_all_settings() or {}
-    host_ssid = settings.get("host_ssid")
+    host_ssid = settings.get("ssid")
     host_password = settings.get("host_password")
     host_ip = settings.get("host_ip")
     host_port = settings.get("host_port", "4000")

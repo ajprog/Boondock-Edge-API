@@ -110,14 +110,7 @@ def login():
                     'error': 'Invalid MFA code',
                     'mfa_required': True
                 }), 401
-        
-        # Get device info for tracking
-        device_info = {
-            'user_agent': request.headers.get('User-Agent', 'Unknown'),
-            'ip_address': request.remote_addr or request.headers.get('X-Forwarded-For', 'Unknown'),
-            'login_time': datetime.now(timezone.utc).isoformat()
-        }
-        
+
         # Store session expiry as timezone-aware UTC.
         now_utc = datetime.now(timezone.utc)
         session_token = secrets.token_urlsafe(32)
@@ -127,84 +120,27 @@ def login():
             'user', email, expires_at.isoformat(), token=session_token
         )
 
-        # Update user's login history and devices
-        if 'login_history' not in user:
-            user['login_history'] = []
-        if 'devices' not in user:
-            user['devices'] = []
-        
-        # Generate device identifier from user agent and IP
-        device_fingerprint = f"{device_info['user_agent']}{device_info['ip_address']}"
-        device_id = hashlib.md5(device_fingerprint.encode()).hexdigest()[:16]
-        
-        # Add to login history (keep last 50)
-        user['login_history'].insert(0, {
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-            'ip_address': device_info['ip_address'],
-            'user_agent': device_info['user_agent'],
-            'device_id': device_id
-        })
-        if len(user['login_history']) > 50:
-            user['login_history'] = user['login_history'][:50]
-        
-        # Track device (if not already tracked)
-        device_exists = any(d.get('device_id') == device_id for d in user['devices'])
-        if not device_exists:
-            # Try to extract device name from user agent
-            user_agent = device_info['user_agent']
-            device_name = "Unknown Device"
-            if 'Windows' in user_agent:
-                device_name = "Windows Device"
-            elif 'Mac' in user_agent or 'MacOS' in user_agent:
-                device_name = "Mac Device"
-            elif 'Linux' in user_agent:
-                device_name = "Linux Device"
-            elif 'Android' in user_agent:
-                device_name = "Android Device"
-            elif 'iPhone' in user_agent or 'iPad' in user_agent:
-                device_name = "iOS Device"
-            
-            user['devices'].append({
-                'device_id': device_id,
-                'user_agent': device_info['user_agent'],
-                'ip_address': device_info['ip_address'],
-                'first_seen': datetime.now(timezone.utc).isoformat(),
-                'last_seen': datetime.now(timezone.utc).isoformat(),
-                'name': device_name
-            })
-        else:
-            # Update last seen
-            for device in user['devices']:
-                if device.get('device_id') == device_id:
-                    device['last_seen'] = datetime.now(timezone.utc).isoformat()
-                    device['ip_address'] = device_info['ip_address']
-                    break
-        
-        # Save updated user data
-        _settings_manager.save_user(email, user)
-        
         # Check if MFA is enforced but not enabled
         mfa_enforced = user.get('mfa_enforced', False)
         show_mfa_reminder = mfa_enforced and not mfa_enabled
         
-        principal = _settings_manager.get_principal('user', email) or {}
-        user_permissions = {
-            permission: True for permission in principal.get('permissions', [])
-        }
+        principal = _settings_manager.get_principal('user', user['id'])
+        if principal is None:
+            logging.error('Unable to materialize principal for user %s', user['id'])
+            return jsonify({'error': 'Internal server error'}), 500
 
         # Return user info (without password and MFA secret)
         return jsonify({
             'token': session_token,
-            'expires_at': expires_at.isoformat(),
             'user': {
-                'email': email,
-                'name': user.get('name', email),
-                'role': user.get('role', 'member'),
-                'status': user.get('status', 'Active'),
-                'groups': user.get('groups', []),
-                'mfa_enabled': mfa_enabled,
-                'mfa_enforced': mfa_enforced,
-                'permissions': user_permissions
+                'id': principal['id'],
+                'email': principal['email'],
+                'name': principal['name'],
+                'role': principal['role'],
+                'groups': principal['groups'],
+                'permissions': principal['permissions'],
+                'keywords': principal['keywords'],
+                'preferences': principal['preferences'],
             },
             'show_mfa_reminder': show_mfa_reminder
         }), 200
@@ -274,8 +210,8 @@ def mfa_setup():
         qr_code = generate_mfa_qr_code(secret, email)
         totp_uri = get_totp_uri(secret, email)
         
-        # Store temporary secret (not enabled yet)
-        user['mfa_secret_temp'] = secret
+        # Store the secret without enabling MFA until the code is verified.
+        user['mfa_secret'] = secret
         
         # Save user
         _settings_manager.save_user(email, user)
@@ -329,19 +265,17 @@ def mfa_verify_setup():
         if user is None:
             return jsonify({'error': 'User authentication required'}), 403
         email = user['email']
-        temp_secret = user.get('mfa_secret_temp', '')
+        pending_secret = user.get('mfa_secret', '')
         
-        if not temp_secret:
+        if not pending_secret:
             return jsonify({'error': 'No MFA setup in progress'}), 400
         
         # Verify TOTP code
-        if not verify_totp_code(temp_secret, totp_code):
+        if not verify_totp_code(pending_secret, totp_code):
             return jsonify({'error': 'Invalid TOTP code'}), 400
         
         # Enable MFA
-        user['mfa_secret'] = temp_secret
         user['mfa_enabled'] = True
-        user.pop('mfa_secret_temp', None)  # Remove temporary secret
         
         # Save user
         _settings_manager.save_user(email, user)
@@ -405,7 +339,6 @@ def mfa_disable():
         # Disable MFA
         user['mfa_enabled'] = False
         user.pop('mfa_secret', None)
-        user.pop('mfa_secret_temp', None)
         
         # Save user
         _settings_manager.save_user(email, user)

@@ -40,7 +40,7 @@ def hotspot_status():
         settings = _settings_manager.get_all_settings()
         # Attach host mapping info used by recorder autoconfiguration
         status["host_settings"] = {
-            "host_ssid": settings.get("host_ssid", ""),
+            "ssid": settings.get("ssid", ""),
             "host_ip": settings.get("host_ip", ""),
             "host_port": settings.get("host_port", "4000"),
         }
@@ -64,7 +64,7 @@ def hotspot_start():
         settings = _settings_manager.get_all_settings()
 
         payload = request.get_json(silent=True) or {}
-        ssid = (payload.get("ssid") or settings.get("host_ssid") or "").strip()
+        ssid = (payload.get("ssid") or settings.get("ssid") or "").strip()
         password = (payload.get("password") or settings.get("host_password") or "").strip()
 
         if not ssid or not password:

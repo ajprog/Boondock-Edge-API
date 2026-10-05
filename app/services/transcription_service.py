@@ -10,16 +10,15 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from datetime import datetime
-from queue import Queue
-from requests.exceptions import HTTPError
-import sqlite3
-import json
-from ..utils.logging_setup import error_logger, warning_logger, transcription_logger, db_logger
+from ..utils.logging_setup import error_logger, transcription_logger
 from ..services.settings_manager import get_settings_manager
 import requests
 
 _local_whisper_compatibility = None
+
+
+class TranscriptionAuthenticationError(Exception):
+    """The remote transcription credential is missing, expired, or rejected."""
 
 
 def _ensure_local_whisper_compatible():
@@ -61,10 +60,10 @@ def _ensure_local_whisper_compatible():
     raise RuntimeError(message)
 
 def request_openai_transcription(audio_file, filename, timeout=60):
-    api_key = get_settings_manager().get_setting("global_transcription_api_key", "")
+    api_key = get_settings_manager().get_setting("transcription_api_key", "")
     if not api_key:
         error_logger.error("Missing Boondock Transcription API Key")
-        raise ValueError("Missing Boondock Transcription API Key")
+        raise TranscriptionAuthenticationError("Missing Boondock Transcription API Key")
 
     """Send audio to the configured OpenAI transcription proxy."""
     headers = {
@@ -112,88 +111,6 @@ class TranscriptionService:
         
         transcription_logger.info("TranscriptionService initialization complete")
         
-    def _filter_hallucinations(self, text):
-        """
-        Filter out common hallucinations from transcription results
-        
-        Args:
-            text (str): Raw transcription text
-            
-        Returns:
-            str: Filtered transcription or "..." if hallucination detected
-        """
-        if not text or len(text.strip()) < 3:
-            return "..."
-            
-        hallucinations = [
-            "thank you.",
-            "thank you",
-            "thank you. thank you",
-            "thank you. thank you.",
-            "thank you. thank you. thank you.",
-            "thank you. bye.",
-            "thank you. bye-bye.",
-            "you",
-            "bye",
-            "bye.",
-            "bye-bye",
-            "bye-bye.",
-            "bye. bye.",
-            "Please see the complete disclaimer at https://sites.google.com/",
-            "... ... ... ... ... ... ... ... ... ...",
-            "thanks for watching",
-            "thanks for watching.",
-            "Tahnks for watching!",
-            "thank you very much.",
-            "thank you very much",
-            "transcription by castingwords",
-            "copyright © 2020, new thinking allowed foundation",
-            "subs by www.zeoranger.co.uk",
-            "thank you for watching!",
-            "thank you for watching.",
-            "thanks for watching!!!",
-            "we'll be right back.",
-            "if you have any questions or other problems, please post them in the comments. how to be a patron http://www.patreon.com thank you for watching!",
-            "if you like this video, please give me a thumb up and subscribe to my channel. thank you so much for watching this video.",
-            "if you have any questions or other problems, please post them in the comments.",
-            "thank you so much for watching this video.",
-            "請不吝點贊訂閱轉發打賞支持明鏡與點點欄目",
-            "toronto 2015 volunteers, presented by chevrolet",
-            "transcribed by https://otter.ai",
-            "www.globalonenessproject.org",
-            "go to beadaholique.com for all of your beading supply needs!",
-            "thank you. thank you. bye.",
-            "© transcript emily beynon",
-            "please subscribe",
-            "like and subscribe",
-            "click the link below",
-            "see you next time",
-            "have a great day",
-            "stay tuned",
-            "coming up next",
-            "don't forget to like",
-            "please like and subscribe",
-            "subscribe now",
-            "hit that subscribe button",
-            "thanks for listening",
-            "see you in the next video",
-            "until next time",
-            "to be continued",
-            "end of transcription",
-            "video ends",
-            "music fades out",
-            "intro music",
-            "outro music",
-            "[music playing]",
-            "[silence]",
-            "uh uh uh",
-            "um um um",
-            "background noise"
-        ]
-
-        lowerText = text.strip().lower()
-        return "..." if lowerText in hallucinations else text    
-
     def _load_whisper_model(self):
         """
         Lazy load the Whisper model only when needed to conserve memory.
@@ -289,23 +206,15 @@ class TranscriptionService:
                 Whisper transcription (e.g. beam_size, best_of, etc.).
             
         Returns:
-            str: Transcription text or "..." if transcription fails
+            str: The successfully returned transcription, including an empty string.
+
+        Raises:
+            TranscriptionAuthenticationError: The cloud API rejected its credential.
+            Exception: The selected transcription method failed.
         """
         # Boondock API path — no fallback to local on failure
         if not use_local:
-            try:
-                result = self._transcribe_boondock_api(filepath)
-                if result:
-                    return result
-                error_logger.error("Boondock API returned empty result for %s", filepath)
-            except (ConnectionResetError, ConnectionError, HTTPError) as e:
-                error_logger.error("Boondock API transcription failed for %s. Error %s: %s", filepath, type(e).__name__, str(e))
-            except Exception as e:
-                error_logger.error(
-                    "Boondock API transcription failed for %s. Error: %s/%s", filepath, type(e).__name__, str(e),
-                    exc_info=True,
-                )
-            return "..."
+            return self._transcribe_boondock_api(filepath)
 
         # Local transcription path
         transcription_logger.info(f"Starting local transcription for file: {filepath}")
@@ -321,17 +230,10 @@ class TranscriptionService:
         elif 'language' not in local_kwargs:
             local_kwargs['language'] = 'en'
         
-        try:
-            transcription_logger.debug("Loading Whisper model for local transcription...")
-            result = self._transcribe_local(filepath, **local_kwargs)
-            if result:
-                transcription_logger.debug(f"Local transcription completed successfully for: {filepath}")
-                return result
-        except Exception as e:
-            error_logger.error(f"Local transcription failed for {filepath}: {str(e)}", exc_info=True)
-
-        error_logger.error(f"Transcription failed for file: {filepath}")
-        return "..."
+        transcription_logger.debug("Loading Whisper model for local transcription...")
+        result = self._transcribe_local(filepath, **local_kwargs)
+        transcription_logger.debug(f"Local transcription completed successfully for: {filepath}")
+        return result
 
     def _transcribe_boondock_api(self, filepath):
         """
@@ -349,6 +251,11 @@ class TranscriptionService:
         transcription_logger.debug(f"Boondock API status: {response.status_code}")
         transcription_logger.debug(f"Boondock API response: {response.text[:500]}")
 
+        if response.status_code == 401:
+            error_logger.error("Boondock API rejected the transcription API key")
+            raise TranscriptionAuthenticationError(
+                "Transcription API authentication failed"
+            )
         response.raise_for_status()
 
         data = response.json()
@@ -422,14 +329,12 @@ class TranscriptionService:
             
             if not segments_list:
                 transcription_logger.warning(f"No segments detected in audio file: {filepath}")
-                return "..."
+                return ""
             
             transcription_logger.debug(f"Extracted {len(segments_list)} segments from audio")
             transcription = " ".join([segment.text for segment in segments_list])
             transcription_logger.debug(f"Raw transcription: {transcription[:100]}..." if len(transcription) > 100 else f"Raw transcription: {transcription}")
             
-            transcription = self._filter_hallucinations(transcription)
-            transcription_logger.debug(f"Filtered transcription: {transcription[:100]}..." if len(transcription) > 100 else f"Filtered transcription: {transcription}")
             transcription_logger.debug("Local transcription completed successfully")
             
             return transcription

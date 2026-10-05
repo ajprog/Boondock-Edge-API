@@ -23,7 +23,7 @@ def get_backup_time():
     """Get backup time from settings, default to 3:00 AM."""
     try:
         settings = _settings_manager.get_all_settings()
-        backup_time_str = settings.get('s3_backup_time', '03:00')
+        backup_time_str = settings.get('scheduled_time', '03:00')
         # Parse time string (HH:MM format)
         try:
             hour, minute = map(int, backup_time_str.split(':'))
@@ -94,7 +94,6 @@ def restart_scheduler():
     """Restart the scheduler (useful when backup time changes)."""
     stop_scheduler()
     start_scheduler()
-
 
 
 

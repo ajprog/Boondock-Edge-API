@@ -1,8 +1,4 @@
-"""
-Settings and keywords management routes.
-Handles global settings CRUD operations and keyword management.
-"""
-import json
+"""Administrator-only category settings and system utility routes."""
 import logging
 import sqlite3
 import threading
@@ -12,7 +8,6 @@ from flasgger import swag_from
 from ..middleware.auth_middleware import require_admin
 import pytz
 
-from ..routes.route_utils import init_settings
 from ..services.settings_manager import get_settings_manager
 from ..services.db_logging_manager import LOGS_DB_PATH
 import subprocess
@@ -28,40 +23,6 @@ _summary_metrics_cache_lock = threading.Lock()
 _summary_metrics_cache = {}
 
 
-@settings_bp.route('/settings', methods=['GET'])
-@require_admin
-@swag_from({
-    'tags': ['Settings'],
-    'summary': 'Get all settings',
-    'responses': {
-        '200': {'description': 'Settings retrieved successfully'},
-        '500': {'description': 'Server error'}
-    }
-})
-def get_settings():
-    """Fetch all settings."""
-    init_settings()
-    try:
-        settings = _settings_manager.get_all_settings()
-
-        # Mask secret keys for security (don't send actual values to the dashboard)
-        # Note: We don't mask host_password because it's needed for Auto Config functionality
-        # The password field is already a password input type which provides some security
-        if 's3_access_key' in settings and settings['s3_access_key']:
-            settings['s3_access_key'] = '***' if settings['s3_access_key'] else ''
-        if 's3_secret_key' in settings and settings['s3_secret_key']:
-            settings['s3_secret_key'] = '***' if settings['s3_secret_key'] else ''
-        # Always mask Samba password when returning to the dashboard
-        if 'samba_password' in settings and settings['samba_password']:
-            settings['samba_password'] = '***'
-        if settings.get('global_transcription_api_key'):
-            settings['global_transcription_api_key'] = '***'
-
-        return jsonify(settings)
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 def _resolve_timezone_name(explicit_timezone=None):
         return 'UTC'
 
@@ -75,8 +36,8 @@ def _get_local_day_bounds(timezone_name):
     local_end = local_start + timedelta(days=1)
     return {
         'local_date': local_now.strftime('%Y-%m-%d'),
-        'recordings_start_utc': local_start.astimezone(timezone.utc).strftime('%Y%m%d_%H%M%S'),
-        'recordings_end_utc': local_end.astimezone(timezone.utc).strftime('%Y%m%d_%H%M%S'),
+        'recordings_start_utc': int(local_start.astimezone(timezone.utc).timestamp() * 1000),
+        'recordings_end_utc': int(local_end.astimezone(timezone.utc).timestamp() * 1000),
         'logs_start': local_start.strftime('%Y-%m-%d %H:%M:%S'),
         'logs_end': local_end.strftime('%Y-%m-%d %H:%M:%S'),
         'timezone': timezone_name,
@@ -184,41 +145,12 @@ def get_summary_metrics():
         except Exception as logs_error:
             logging.warning(f"Summary logs query failed: {logs_error}")
 
-        total_users = 0
-        user_logins = 0
-        try:
-            users = _settings_manager.get_all_users()
-            tz = pytz.timezone(timezone_name)
-            today_str = bounds['local_date']
-            for email, user_data in users.items():
-                if not (isinstance(user_data, dict) and (user_data.get('name') or user_data.get('role') or user_data.get('email') or email)):
-                    continue
-                total_users += 1
-                history = user_data.get('login_history', [])
-                if not isinstance(history, list):
-                    continue
-                for login in history:
-                    ts = login.get('timestamp') if isinstance(login, dict) else None
-                    if not ts:
-                        continue
-                    try:
-                        dt = datetime.fromisoformat(str(ts).replace('Z', '+00:00'))
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        if dt.astimezone(tz).strftime('%Y-%m-%d') == today_str:
-                            user_logins += 1
-                    except Exception:
-                        continue
-        except Exception as users_error:
-            logging.warning(f"Summary users query failed: {users_error}")
-
         payload = {
             'total_recordings': total_recordings,
             'today_recordings': today_recordings,
             'errors': errors,
             'warnings': warnings,
-            'user_logins': user_logins,
-            'total_users': total_users,
+            'total_users': _settings_manager.count_users(),
             'timezone': bounds['timezone'],
             'local_date': bounds['local_date'],
             'cached_for_seconds': SUMMARY_METRICS_CACHE_TTL_SECONDS,
@@ -230,169 +162,260 @@ def get_summary_metrics():
         logging.error(f"Error building summary metrics: {e}")
         return jsonify({'error': 'Failed to get summary metrics'}), 500
 
-@settings_bp.route('/settings', methods=['PUT'])
+def _request_object():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        raise ValueError('Request body must be a JSON object')
+    return data
+
+
+def _reject_unknown_fields(data, allowed):
+    unknown = sorted(set(data) - set(allowed))
+    if unknown:
+        raise ValueError(f"Unknown field(s): {', '.join(unknown)}")
+
+
+def _require_type(data, field, expected_type):
+    if field in data and not isinstance(data[field], expected_type):
+        raise ValueError(f'{field} has an invalid type')
+
+
+def _secret_value(value, field):
+    if not isinstance(value, str):
+        raise ValueError(f'{field} must be a string')
+    return value if value.strip() else ''
+
+
+def _save_settings(changes):
+    if changes and not _settings_manager.set_all_settings(changes):
+        raise RuntimeError('Failed to save settings')
+
+
+def _settings_error(error):
+    status = 400 if isinstance(error, ValueError) else 500
+    return jsonify({'error': str(error)}), status
+
+
+@settings_bp.route('/settings/transcription', methods=['GET'])
 @require_admin
-@swag_from({
-    'tags': ['Settings'],
-    'summary': 'Update settings',
-    'parameters': [
-        {
-            'name': 'body',
-            'in': 'body',
-            'required': True,
-            'schema': {
-                'type': 'object',
-                'properties': {
-                    'global_model': {'type': 'string'},
-                    'global_target_language': {'type': 'string'},
-                    'global_transcribe_method': {'type': 'string', 'enum': ['local', 'openai']},
-                    'global_transcription_api_key': {'type': 'string'},
-                    'global_hallucination': {'type': 'string'},
-                    'global_enable_uniden_scanners': {'type': 'string'},
-                    'global_enable_edge_devices': {'type': 'string'},
-                    'global_enable_usb_audio_devices': {'type': 'string'},
-                    'global_enable_s3_upload': {'type': 'string'},
-                    'global_live_mode_enabled': {'type': 'string', 'description': 'Enable live mode for automatic message playback'},
-                    's3_endpoint_url': {'type': 'string'},
-                    's3_access_key': {'type': 'string'},
-                    's3_secret_key': {'type': 'string'},
-                    's3_region': {'type': 'string'},
-                    's3_bucket_name': {'type': 'string'},
-                    's3_backup_time': {'type': 'string'}
-                }
-            }
-        }
-    ],
-    'responses': {
-        '200': {'description': 'Settings updated successfully'},
-        '400': {'description': 'Bad request'},
-        '500': {'description': 'Server error'}
-    }
-})
-def update_settings():
-    """Update settings."""
-    init_settings()
+def get_transcription_settings():
+    settings = _settings_manager.get_all_settings()
+    return jsonify({
+        'target_language': settings.get('target_language', 'english'),
+        'model': settings.get('model', 'tiny.en'),
+        'method': settings.get('method', 'local'),
+        'queue_enabled': bool(settings.get('transcription_queue_enabled', True)),
+        'api_key_configured': bool(settings.get('transcription_api_key')),
+    })
+
+
+@settings_bp.route('/settings/transcription', methods=['PATCH'])
+@require_admin
+def update_transcription_settings():
     try:
-        data = request.get_json()
-
-        # Validate required fields
-        if not isinstance(data, dict):
-            return jsonify({'error': 'Invalid data format'}), 400
-
-        current_settings = _settings_manager.get_all_settings()
-
-        # The API cannot safely change the network that is currently carrying
-        # this request. External Wi-Fi details are synchronized from
-        # NetworkManager by the hotspot status endpoint instead.
-        # requested_wifi_fields = {'host_ssid', 'host_password', 'host_ip'} & data.keys()
-        # if requested_wifi_fields:
-        #     wifi_change_requested = any(
-        #         data[field] not in ('', '***', current_settings[field])
-        #         for field in requested_wifi_fields
-        #     )
-        #     if current_settings['external_wifi'] and current_settings['host_password'] and wifi_change_requested:
-        #         return jsonify({
-        #             'error': (
-        #                 'Wi-Fi settings cannot be changed while the API is using '
-        #                 'an external Wi-Fi connection.'
-        #             )
-        #         }), 409
-
-        # The recorder API port is fixed. Accept an unchanged value because
-        # the settings form may submit its entire model, but reject mutations.
-        # if 'host_port' in data and str(data['host_port']) != str(current_settings.get('host_port', '4000')):
-        #     return jsonify({'error': 'The host port cannot be changed.'}), 400
-
-        # Update fields if provided
-        updateable_fields = [
-            'global_model',
-            'global_target_language',
-            'global_transcribe_method',
-            'global_transcription_api_key',
-            'global_hallucination',
-            # Inbox / live communications behaviour
-            'global_inbox_view_mode',
-            'global_inbox_records_per_page',
-            'global_enable_uniden_scanners',
-            'global_enable_edge_devices',
-            'global_enable_usb_audio_devices',
-            'global_enable_s3_upload',
-            'global_show_duplicate_files',  # Display duplicates in inbox
-            'global_live_mode_enabled',  # Live mode for automatic message playback
-            's3_endpoint_url',
-            's3_access_key',
-            's3_secret_key',
-            's3_region',
-            's3_bucket_name',
-            's3_backup_time',
-            # Maintenance settings
-            'maintenance_time',
-            'maintenance_enabled_tasks',
-            # Samba / network share backup settings
-            'samba_backup_enabled',
-            'samba_share_path',
-            'samba_username',
-            'samba_password',
-            'host_ssid',
-            'host_password',
-            'host_ip',
-        ]
-
-        if ('global_transcribe_method' in data and
-                data['global_transcribe_method'] not in {'local', 'openai'}):
-            return jsonify({'error': "global_transcribe_method must be 'local' or 'openai'"}), 400
-
-        for field in updateable_fields:
-            if field in data:
-                value = data[field]
-                if isinstance(value, bool):
-                    value = value
-                elif isinstance(value, str) and value.lower() in {'true', 'false'}:
-                    value = value.lower() == 'true'
-                # For secret keys and passwords, only update if a non-empty value is provided
-                # This allows users to update other fields without clearing the keys
-                # Also handle the case where the dashboard sends '***' as a placeholder
-                if field in ['s3_access_key', 's3_secret_key', 'host_password', 'samba_password',
-                             'global_transcription_api_key']:
-                    if value and value.strip() and value.strip() != '***':
-                        current_settings[field] = value
-                    # If empty string or '***', don't update (preserve existing value)
-                else:
-                    current_settings[field] = value
-
-        # Save all settings using SettingsManager
-        _settings_manager.set_all_settings(current_settings)
-
-        # Reload transcription settings at runtime if transcription mode changed
-        if 'global_transcribe_method' in data or 'global_transcription_api_key' in data:
+        data = _request_object()
+        _reject_unknown_fields(
+            data,
+            {'target_language', 'model', 'method', 'queue_enabled', 'api_key'},
+        )
+        for field in ('target_language', 'model', 'method'):
+            _require_type(data, field, str)
+        if data.get('method', 'local') not in {'local', 'openai'}:
+            raise ValueError("method must be 'local' or 'openai'")
+        _require_type(data, 'queue_enabled', bool)
+        changes = {key: data[key] for key in ('target_language', 'model', 'method') if key in data}
+        if 'queue_enabled' in data:
+            changes['transcription_queue_enabled'] = data['queue_enabled']
+        if 'api_key' in data:
+            changes['transcription_api_key'] = _secret_value(data['api_key'], 'api_key')
+        _save_settings(changes)
+        if 'queue_enabled' in data:
+            from ..services.audio_handler import get_audio_handler
+            audio_handler = get_audio_handler()
+            if data['queue_enabled'] and not audio_handler.running:
+                audio_handler.start()
+            elif not data['queue_enabled'] and audio_handler.running:
+                audio_handler.stop_queue()
+        if changes:
             try:
                 from ..services.audio_handler import reload_transcription_settings
                 reload_transcription_settings()
-                logging.info("Audio handler transcription settings reloaded without restart")
-            except Exception as e:
-                logging.warning(f"Failed to reload audio handler transcription settings: {str(e)}")
+            except Exception as error:
+                logging.warning('Failed to reload transcription settings: %s', error)
+        return get_transcription_settings()
+    except Exception as error:
+        return _settings_error(error)
 
-        # Restart S3 scheduler if backup time changed
-        if 's3_backup_time' in data:
+
+@settings_bp.route('/settings/audio-processing', methods=['GET'])
+@require_admin
+def get_audio_processing_settings():
+    return jsonify({'hallucination_patterns': _settings_manager.get_all_hallucinations()})
+
+
+@settings_bp.route('/settings/audio-processing', methods=['PATCH'])
+@require_admin
+def update_audio_processing_settings():
+    try:
+        data = _request_object()
+        _reject_unknown_fields(data, {'hallucination_patterns'})
+        if 'hallucination_patterns' in data:
+            _settings_manager.replace_hallucinations(data['hallucination_patterns'])
+        return get_audio_processing_settings()
+    except Exception as error:
+        return _settings_error(error)
+
+
+@settings_bp.route('/settings/recorders', methods=['GET'])
+@require_admin
+def get_recorder_settings():
+    settings = _settings_manager.get_all_settings()
+    return jsonify({
+        'uniden_scanners_enabled': bool(settings.get('uniden_scanners_enabled', False)),
+        'edge_recorders_enabled': bool(settings.get('edge_recorders_enabled', True)),
+    })
+
+
+@settings_bp.route('/settings/recorders', methods=['PATCH'])
+@require_admin
+def update_recorder_settings():
+    try:
+        data = _request_object()
+        fields = {'uniden_scanners_enabled', 'edge_recorders_enabled'}
+        _reject_unknown_fields(data, fields)
+        for field in fields:
+            _require_type(data, field, bool)
+        _save_settings({key: data[key] for key in fields if key in data})
+        return get_recorder_settings()
+    except Exception as error:
+        return _settings_error(error)
+
+
+@settings_bp.route('/settings/wifi', methods=['GET'])
+@require_admin
+def get_wifi_settings():
+    settings = _settings_manager.get_all_settings()
+    try:
+        host_port = int(settings.get('host_port', 4000))
+    except (TypeError, ValueError):
+        host_port = 4000
+    return jsonify({
+        'ssid': settings.get('ssid', ''),
+        'password_configured': bool(settings.get('host_password')),
+        'host_ip': settings.get('host_ip', ''),
+        'host_port': host_port,
+    })
+
+
+@settings_bp.route('/settings/wifi', methods=['PATCH'])
+@require_admin
+def update_wifi_settings():
+    try:
+        data = _request_object()
+        _reject_unknown_fields(data, {'ssid', 'password', 'host_ip', 'host_port'})
+        for field in ('ssid', 'host_ip'):
+            _require_type(data, field, str)
+        if 'host_port' in data and (isinstance(data['host_port'], bool) or
+                                    not isinstance(data['host_port'], int) or
+                                    not 1 <= data['host_port'] <= 65535):
+            raise ValueError('host_port must be an integer between 1 and 65535')
+        changes = {key: data[key] for key in ('ssid', 'host_ip', 'host_port') if key in data}
+        if 'password' in data:
+            changes['host_password'] = _secret_value(data['password'], 'password')
+        _save_settings(changes)
+        return get_wifi_settings()
+    except Exception as error:
+        return _settings_error(error)
+
+
+@settings_bp.route('/settings/backup', methods=['GET'])
+@require_admin
+def get_backup_settings():
+    settings = _settings_manager.get_all_settings()
+    return jsonify({
+        's3_enabled': bool(settings.get('s3_enabled', False)),
+        's3_endpoint_url': settings.get('s3_endpoint_url', ''),
+        's3_access_key_configured': bool(settings.get('s3_access_key')),
+        's3_secret_key_configured': bool(settings.get('s3_secret_key')),
+        's3_region': settings.get('s3_region', 'us-east-1'),
+        's3_bucket_name': settings.get('s3_bucket_name', ''),
+        'samba_enabled': bool(settings.get('samba_enabled', False)),
+        'samba_share_path': settings.get('samba_share_path', ''),
+        'samba_username': settings.get('samba_username', ''),
+        'samba_password_configured': bool(settings.get('samba_password')),
+    })
+
+
+@settings_bp.route('/settings/backup', methods=['PATCH'])
+@require_admin
+def update_backup_settings():
+    try:
+        data = _request_object()
+        plain_fields = {
+            's3_enabled', 's3_endpoint_url', 's3_region', 's3_bucket_name',
+            'samba_enabled', 'samba_share_path', 'samba_username',
+        }
+        secret_fields = {'s3_access_key', 's3_secret_key', 'samba_password'}
+        _reject_unknown_fields(data, plain_fields | secret_fields)
+        for field in ('s3_enabled', 'samba_enabled'):
+            _require_type(data, field, bool)
+        for field in plain_fields - {'s3_enabled', 'samba_enabled'}:
+            _require_type(data, field, str)
+        changes = {key: data[key] for key in plain_fields if key in data}
+        for field in secret_fields:
+            if field in data:
+                changes[field] = _secret_value(data[field], field)
+        _save_settings(changes)
+        return get_backup_settings()
+    except Exception as error:
+        return _settings_error(error)
+
+
+@settings_bp.route('/settings/maintenance', methods=['GET'])
+@require_admin
+def get_maintenance_settings():
+    settings = _settings_manager.get_all_settings()
+    return jsonify({
+        'scheduled_time': settings.get('scheduled_time', '03:00'),
+        'enabled_tasks': settings.get(
+            'enabled_tasks', ['data_backup', 'logs_cleanup', 'health_checks']
+        ),
+    })
+
+
+@settings_bp.route('/settings/maintenance', methods=['PATCH'])
+@require_admin
+def update_maintenance_settings():
+    try:
+        data = _request_object()
+        _reject_unknown_fields(data, {'scheduled_time', 'enabled_tasks'})
+        if 'scheduled_time' in data:
+            if not isinstance(data['scheduled_time'], str):
+                raise ValueError('scheduled_time must be a string')
             try:
-                from ..services.s3_scheduler import restart_scheduler
-                restart_scheduler()
-                logging.info("S3 backup scheduler restarted with new backup time")
-            except Exception as e:
-                logging.warning(f"Failed to restart S3 scheduler: {str(e)}")
-        
-        # Restart maintenance scheduler if maintenance time or enabled tasks changed
-        if 'maintenance_time' in data or 'maintenance_enabled_tasks' in data:
+                parsed = datetime.strptime(data['scheduled_time'], '%H:%M')
+            except ValueError as error:
+                raise ValueError('scheduled_time must use HH:MM') from error
+            if parsed.strftime('%H:%M') != data['scheduled_time']:
+                raise ValueError('scheduled_time must use HH:MM')
+        valid_tasks = {'data_backup', 'logs_cleanup', 'health_checks'}
+        if 'enabled_tasks' in data:
+            tasks = data['enabled_tasks']
+            if (not isinstance(tasks, list) or
+                    any(not isinstance(task, str) or task not in valid_tasks for task in tasks)):
+                raise ValueError('enabled_tasks contains an invalid task')
+            if len(tasks) != len(set(tasks)):
+                raise ValueError('enabled_tasks cannot contain duplicates')
+        _save_settings({key: data[key] for key in ('scheduled_time', 'enabled_tasks') if key in data})
+        if data:
             try:
                 from ..services.maintenance_scheduler import restart_scheduler
                 restart_scheduler()
-                logging.info("Maintenance scheduler restarted with new settings")
-            except Exception as e:
-                logging.warning(f"Failed to restart maintenance scheduler: {str(e)}")
-
-        return jsonify({'message': 'Settings updated successfully'})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+            except Exception as error:
+                logging.warning('Failed to restart maintenance scheduler: %s', error)
+        return get_maintenance_settings()
+    except Exception as error:
+        return _settings_error(error)
 
 
 @settings_bp.route('/settings/restart-service', methods=['POST'])
@@ -456,127 +479,6 @@ def reboot_application():
     """
     # Reuse the same logic as restart_system_service (includes OPTIONS handling and Linux guard)
     return restart_system_service()
-
-
-@settings_bp.route('/settings/keywords', methods=['POST'])
-@require_admin
-@swag_from({
-    'tags': ['Settings'],
-    'summary': 'Add a keyword',
-    'parameters': [
-        {
-            'name': 'body',
-            'in': 'body',
-            'required': True,
-            'schema': {
-                'type': 'object',
-                'required': ['keyword'],
-                'properties': {
-                    'keyword': {'type': 'string'}
-                }
-            }
-        }
-    ],
-    'responses': {
-        '200': {'description': 'Keyword added successfully'},
-        '400': {'description': 'Bad request'},
-        '500': {'description': 'Server error'}
-    }
-})
-def add_keyword():
-    """Add a new keyword"""
-    try:
-        # Validate request data
-        data = request.get_json()
-        if not data:
-            return jsonify({'error': 'No data provided'}), 400
-            
-        if 'keyword' not in data:
-            return jsonify({'error': 'Keyword is required'}), 400
-            
-        keyword = data.get('keyword')
-        if not isinstance(keyword, str):
-            return jsonify({'error': 'Keyword must be a string'}), 400
-            
-        keyword = keyword.strip()
-        if not keyword:
-            return jsonify({'error': 'Keyword cannot be empty'}), 400
-        
-        # Initialize or get current settings
-        try:
-            init_settings()
-            settings = _settings_manager.get_all_settings()
-            
-            # Ensure keywords is a list
-            if not isinstance(settings.get('keywords', []), list):
-                settings['keywords'] = []
-            
-            # Add keyword if not already present
-            if keyword not in settings['keywords']:
-                settings['keywords'].append(keyword)
-                
-                # Save updated settings using SettingsManager
-                _settings_manager.set_all_settings(settings)
-            
-            return jsonify({
-                'message': 'Keyword added successfully',
-                'keywords': settings['keywords']
-            })
-            
-        except Exception as e:
-            logging.error(f"Error processing settings: {str(e)}")
-            return jsonify({'error': f'Settings error: {str(e)}'}), 500
-        
-    except Exception as e:
-        logging.error(f"Error adding keyword: {str(e)}")
-        return jsonify({'error': str(e)}), 500
-
-
-@settings_bp.route('/settings/keywords/<keyword>', methods=['DELETE'])
-@require_admin
-@swag_from({
-    'tags': ['Settings'],
-    'summary': 'Remove a keyword',
-    'parameters': [
-        {
-            'name': 'keyword',
-            'in': 'path',
-            'type': 'string',
-            'required': True,
-            'description': 'Keyword to remove'
-        }
-    ],
-    'responses': {
-        '200': {'description': 'Keyword removed successfully'},
-        '500': {'description': 'Server error'}
-    }
-})
-def remove_keyword(keyword):
-    """Remove a keyword"""
-    try:
-        # Get current settings
-        init_settings()
-        settings = _settings_manager.get_all_settings()
-        
-        # Ensure keywords exists and is a list
-        if not isinstance(settings.get('keywords', []), list):
-            settings['keywords'] = []
-        
-        # Remove keyword if it exists
-        if keyword in settings['keywords']:
-            settings['keywords'].remove(keyword)
-            
-            # Save updated settings using SettingsManager
-            _settings_manager.set_all_settings(settings)
-            
-        return jsonify({
-            'message': 'Keyword removed successfully',
-            'keywords': settings['keywords']
-        })
-        
-    except Exception as e:
-        logging.error(f"Error removing keyword: {str(e)}")
-        return jsonify({'error': str(e)}), 500
 
 
 @settings_bp.route('/time', methods=['GET'])

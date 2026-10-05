@@ -23,17 +23,17 @@ class APIKeyManager:
 
     def create_key(self, name, scopes=None, created_by=None, expires_at=None, owner=None):
         raw_key = KEY_PREFIX + secrets.token_urlsafe(32)
-        key_id = str(uuid.uuid4())
         permissions = scopes or list(DEFAULT_SCOPES)
         created_at = datetime.now(timezone.utc).isoformat()
         owner = owner or (f'user:{created_by}' if created_by else self._default_owner())
         with self._connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """INSERT INTO api_keys
-                   (id, name, permissions, owner, created_at, created_by)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (key_id, name, json.dumps(permissions), owner, created_at, created_by),
+                   (name, permissions, owner, created_at, created_by)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (name, json.dumps(permissions), owner, created_at, created_by),
             )
+            key_id = cursor.lastrowid
             connection.execute(
                 """INSERT INTO credentials
                    (id, principal_type, principal_id, token_hash, created_at, expires_at)

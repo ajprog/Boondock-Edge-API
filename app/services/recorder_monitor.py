@@ -44,6 +44,8 @@ _last_known_mac = {}  # port -> MAC address (to track MAC per port)
 _last_channel_check_time = {}  # MAC -> timestamp of last channel check (to avoid spamming)
 _flashing_ports = set()  # Set of ports currently being flashed (to prevent monitoring restart)
 _flashing_lock = threading.Lock()  # Lock for flashing_ports set
+_pending_config_exports = {}  # port -> MAC awaiting one initial EXPORT document
+_synchronized_config_mac = {}  # port -> MAC synchronized for this connection
 # Last HEALTH CLI poll per port (DEVICE_SERIAL.md: rc/uc/pq only in ty=health)
 _last_health_poll = {}  # port -> unix time
 _HEALTH_POLL_INTERVAL_SEC = 50.0
@@ -614,20 +616,49 @@ def _add_message(port, message):
                 waiter['event'].set()
     if json_data:
         _process_parsed_message(port, json_data, timestamp)
-    
+
+        export_mac = _pending_config_exports.get(port)
+        if export_mac and not json_data.get('ty'):
+            try:
+                from .channel_recorder_sync import import_recorder_configuration
+
+                channel = _settings_manager.get_channel_by_mac(export_mac)
+                if channel:
+                    import_recorder_configuration(
+                        channel,
+                        {'port': port},
+                        json_data,
+                    )
+                    _pending_config_exports.pop(port, None)
+                    _synchronized_config_mac[port] = export_mac
+                    _logger.info(
+                        'Synchronized recorder configuration into channel %s on %s',
+                        channel['id'], port,
+                    )
+            except Exception as exc:
+                _pending_config_exports.pop(port, None)
+                _logger.error(
+                    'Failed to synchronize initial recorder configuration on %s: %s',
+                    port, exc,
+                )
+
     # Extract and store MAC address if present in message
     mac_address = _extract_mac_from_message(message)
     if mac_address:
         with _monitoring_lock:
             _last_known_mac[port] = mac_address
-        
+
         # Auto-create channel if needed (check at most once per minute per MAC)
         current_time = time.time()
         last_check = _last_channel_check_time.get(mac_address, 0)
         if current_time - last_check > 60:  # Check at most once per minute
             _last_channel_check_time[mac_address] = current_time
             _ensure_channel_for_mac(mac_address)
-    
+        if (_synchronized_config_mac.get(port) != mac_address and
+                _pending_config_exports.get(port) != mac_address):
+            if send_command_to_port(port, 'EXPORT'):
+                _pending_config_exports[port] = mac_address
+
     # Reboot: log line with rr (DEVICE_SERIAL) or legacy info INIT (+ optional fw)
     if _detect_reboot(message):
         try:
@@ -1080,7 +1111,13 @@ def start_monitoring_for_device(port):
 
 def stop_monitoring_for_device(port):
     """Stop monitoring a specific device."""
+    from .channel_recorder_sync import forget_recorder_configuration
+
+    forget_recorder_configuration(port)
     with _monitoring_lock:
+        _pending_config_exports.pop(port, None)
+        _synchronized_config_mac.pop(port, None)
+        _last_known_mac.pop(port, None)
         if port not in _monitoring_threads:
             # Even if no thread, ensure connection is closed
             if port in _monitoring_connections:
@@ -1284,7 +1321,10 @@ def _line_indicates_command_ok(message, json_data=None):
     upper = message.upper()
     return any(
         marker in upper
-        for marker in ('SET OK', 'SAVE OK', 'CONFIG OK', 'REBOOT', 'AUTOCONFIG OK')
+        for marker in (
+            'SET OK', 'SAVE OK', 'CONFIG OK', 'IMPORT OK', 'REBOOT',
+            'AUTOCONFIG OK',
+        )
     )
 
 
@@ -1296,7 +1336,7 @@ def _clear_response_waiter(port):
         stale['event'].set()
 
 
-def send_command_and_wait_response(port, command, timeout=5.0):
+def send_command_and_wait_response(port, command, timeout=5.0, log_command=None):
     """
     Send a command to a serial port and wait for a JSON response with status=="ok", or timeout.
     If the port has an active monitoring connection, uses it and the monitor thread fulfills the waiter.
@@ -1327,7 +1367,7 @@ def send_command_and_wait_response(port, command, timeout=5.0):
                     _logger.error("Failed to send command to %s: %s", port, exc)
                     _response_waiters.pop(port, None)
                     return False, None
-            _add_message(port, f"[SENT] {command}")
+            _add_message(port, f"[SENT] {log_command or command}")
             ok = event.wait(timeout=timeout)
             with _monitoring_lock:
                 data = _response_waiters.pop(port, None)
@@ -1344,7 +1384,7 @@ def send_command_and_wait_response(port, command, timeout=5.0):
         with Serial(port=port, baudrate=115200, timeout=0.5, write_timeout=2.0) as ser:
             ser.write(command_bytes)
             ser.flush()
-            _add_message(port, f"[SENT] {command}")
+            _add_message(port, f"[SENT] {log_command or command}")
             deadline = time.time() + timeout
             while time.time() < deadline:
                 line = ser.readline()

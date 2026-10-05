@@ -16,6 +16,11 @@ def test_principal_retrieval_and_unified_authentication(
             "description": "Members",
             "is_default": True,
             "permissions": ["channel.read"],
+            "keywords": [{
+                "pattern": "engine fire",
+                "match_type": "literal",
+                "case_sensitive": False,
+            }],
         }
     )
     manager.save_user(
@@ -24,7 +29,6 @@ def test_principal_retrieval_and_unified_authentication(
             "name": "Member",
             "password": "unused",
             "role": "member",
-            "status": "Active",
             "groups": [group_id],
         },
     )
@@ -34,7 +38,6 @@ def test_principal_retrieval_and_unified_authentication(
             "name": "Admin",
             "password": "unused",
             "role": "admin",
-            "status": "Active",
             "groups": [],
         },
     )
@@ -61,7 +64,9 @@ def test_principal_retrieval_and_unified_authentication(
     member = auth.authenticate_token("member-token")
     assert member["type"] == "user"
     assert member["permissions"] == ["channel.read"]
-    assert member["owner_ids"] == ["user:member@example.com", f"group:{group_id}"]
+    assert member["groups"][0]["keywords"] == [member["keywords"][0]["id"]]
+    assert member["keywords"][0]["pattern"] == "engine fire"
+    assert member["owner_ids"] == [f"user:{member['id']}", f"group:{group_id}"]
     assert "password" not in member
 
     assert auth.authenticate_token("admin-token")["owner_ids"] is None

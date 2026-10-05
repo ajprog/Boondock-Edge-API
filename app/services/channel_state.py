@@ -6,7 +6,7 @@ import threading
 import time
 from config import Config
 from typing import Dict, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from flask import request
 
 from .settings_manager import get_settings_manager, normalize_mac_address
@@ -157,8 +157,8 @@ def _recording_join_scope(principal):
 
 def _recording_request_filters(clauses, parameters):
     """Add common recording filters from the current request query string."""
-    since_timestamp = request.args.get('since_timestamp', type=str)
-    before_timestamp = request.args.get('before_timestamp', type=str)
+    since_timestamp = request.args.get('since_timestamp', type=int)
+    before_timestamp = request.args.get('before_timestamp', type=int)
     before_id = request.args.get('before_id', type=int)
 
     if since_timestamp:
@@ -181,24 +181,28 @@ def _recording_request_filters(clauses, parameters):
     day = request.args.get('day', type=int)
     hour = request.args.get('hour', type=int)
 
-    timestamp_prefix = None
     if year is not None and month is not None:
-        timestamp_prefix = f"{year}{month:02d}"
-        if day is not None:
-            timestamp_prefix += f"{day:02d}_"
+        try:
+            start = datetime(year, month, day or 1, hour or 0, tzinfo=timezone.utc)
             if hour is not None:
-                timestamp_prefix += f"{hour:02d}"
-
-    if timestamp_prefix:
-        clauses.append("recordings.timestamp LIKE ?")
-        parameters.append(f"{timestamp_prefix}%")
+                end = start + timedelta(hours=1)
+            elif day is not None:
+                end = start + timedelta(days=1)
+            elif month == 12:
+                end = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+            else:
+                end = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+            clauses.extend(("recordings.timestamp >= ?", "recordings.timestamp < ?"))
+            parameters.extend((int(start.timestamp() * 1000), int(end.timestamp() * 1000)))
+        except ValueError:
+            clauses.append("0")
 
     return hour is not None
 
 def _recording_connection():
     """Open the recordings DB and attach the real settings DB for ownership joins."""
     connection = connect_sqlite(
-        Config.get_recordings_db_path(), row_factory=True
+        Config.get_recordings_db_path(), row_factory=True, typed=True
     )
     try:
         connection.execute(
@@ -269,3 +273,124 @@ def load_owned_recordings(principal, value = None, id_argument = None):
         rows = connection.execute(query, parameters).fetchall()
 
     return [dict(row) for row in rows]
+
+
+def _inbox_argument(name, default=None):
+    value = request.args.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as error:
+        raise ValueError(f'{name} must be an integer') from error
+
+
+def load_inbox(principal, value=None, id_argument=None):
+    """Load one authorized inbox window and its matching total."""
+    try:
+        joins, base_clauses, base_parameters = _recording_join_scope(principal)
+        channel_values = []
+        for value in request.args.getlist('channel_ids'):
+            channel_values.extend(part.strip() for part in value.split(',') if part.strip())
+        if channel_values:
+            try:
+                channel_ids = [int(item) for item in channel_values]
+            except ValueError as error:
+                raise ValueError('channel_ids must contain integers') from error
+            if any(channel_id <= 0 for channel_id in channel_ids):
+                raise ValueError('channel_ids must contain positive integers')
+            placeholders = ','.join('?' for _ in channel_ids)
+            base_clauses.append(f'recordings.channel_id IN ({placeholders})')
+            base_parameters.extend(channel_ids)
+
+        start_at = _inbox_argument('start_at')
+        end_at = _inbox_argument('end_at')
+        updated_since = _inbox_argument('updated_since')
+        before_timestamp = _inbox_argument('before_timestamp')
+        before_id = _inbox_argument('before_id')
+        offset = _inbox_argument('offset', 0)
+        limit = _inbox_argument('limit')
+        sort_direction = request.args.get('sort_direction', 'newest_first')
+        if sort_direction not in {'newest_first', 'oldest_first'}:
+            raise ValueError('sort_direction must be newest_first or oldest_first')
+        if start_at is not None:
+            base_clauses.append('recordings.timestamp >= ?')
+            base_parameters.append(start_at)
+        if end_at is not None:
+            base_clauses.append('recordings.timestamp <= ?')
+            base_parameters.append(end_at)
+        if start_at is not None and end_at is not None and start_at > end_at:
+            raise ValueError('start_at must not be greater than end_at')
+        if updated_since is not None and end_at is not None:
+            raise ValueError('poll requests cannot include end_at')
+        if (before_timestamp is None) != (before_id is None):
+            raise ValueError('before_timestamp and before_id must be supplied together')
+        if updated_since is not None and before_timestamp is not None:
+            raise ValueError('poll requests cannot include older-window boundaries')
+        if updated_since is None and offset:
+            raise ValueError('offset is only valid for poll requests')
+        if offset < 0:
+            raise ValueError('offset must not be negative')
+
+        inbox_preferences = principal.get('preferences', {}).get('inbox', {})
+        if not inbox_preferences.get('show_duplicate_recordings', False):
+            base_clauses.append('recordings.is_duplicate = FALSE')
+        if not inbox_preferences.get('show_hallucinations', False):
+            base_clauses.append('recordings.is_hallucination = FALSE')
+        if limit is None:
+            preferred = inbox_preferences.get('records_per_page', 20)
+            limit = preferred if isinstance(preferred, int) and preferred > 0 else 100
+        if limit < 1 or limit > 500:
+            raise ValueError('limit must be between 1 and 500')
+
+        where = ' AND '.join(base_clauses) if base_clauses else '1'
+        with _recording_connection() as connection:
+            total = connection.execute(
+                f"SELECT COUNT(DISTINCT recordings.id) FROM recordings {' '.join(joins)} WHERE {where}",
+                base_parameters,
+            ).fetchone()[0]
+
+            clauses = list(base_clauses)
+            parameters = list(base_parameters)
+            if updated_since is not None:
+                clauses.append('recordings.updated_at >= ?')
+                parameters.append(updated_since)
+                order = 'recordings.updated_at ASC, recordings.id ASC'
+            else:
+                direction = 'DESC' if sort_direction == 'newest_first' else 'ASC'
+                if before_timestamp is not None:
+                    operator = '<' if direction == 'DESC' else '>'
+                    clauses.append(
+                        f'(recordings.timestamp {operator} ? OR '
+                        f'(recordings.timestamp = ? AND recordings.id {operator} ?))'
+                    )
+                    parameters.extend((before_timestamp, before_timestamp, before_id))
+                order = f'recordings.timestamp {direction}, recordings.id {direction}'
+            query = f"""
+                SELECT DISTINCT recordings.id, recordings.channel_id,
+                    recordings.filename, recordings.timestamp, recordings.status,
+                    recordings.transcription, recordings.duration,
+                    recordings.is_hallucination, recordings.updated_at
+                FROM recordings {' '.join(joins)}
+                WHERE {' AND '.join(clauses) if clauses else '1'}
+                ORDER BY {order} LIMIT ? OFFSET ?
+            """
+            rows = connection.execute(query, (*parameters, limit + 1, offset)).fetchall()
+
+        has_more = len(rows) > limit
+        messages = [dict(row) for row in rows[:limit]]
+        last = messages[-1] if messages else None
+        return ({
+            'messages': messages,
+            'meta': {
+                'total': total,
+                'has_more': has_more,
+                'next_before_timestamp': (
+                    last['timestamp'] if has_more and updated_since is None else None
+                ),
+                'next_before_id': last['id'] if has_more and updated_since is None else None,
+                'next_offset': offset + limit if has_more and updated_since is not None else None,
+            },
+        }, 200)
+    except ValueError as error:
+        return ({'error': str(error)}, 400)

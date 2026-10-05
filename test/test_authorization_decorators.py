@@ -10,7 +10,6 @@ def _issue_user(manager, email, role, groups, token):
             "name": email,
             "password": "unused",
             "role": role,
-            "status": "Active",
             "groups": groups,
         },
     )

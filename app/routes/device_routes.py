@@ -814,7 +814,7 @@ def upload_audio_s3(channel):
                 try:
                     cursor = conn.cursor()
 
-                    db_timestamp = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+                    db_timestamp = int(datetime.now(timezone.utc).timestamp() * 1000)
                     relative_path = absolute_path.relative_to(DATA_ROOT).as_posix()
                     cursor.execute('''
                         INSERT INTO recordings (channel_id, filename, timestamp, transcription, status, is_duplicate, crc, filesize, duration)

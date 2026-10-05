@@ -12,6 +12,7 @@ import secrets
 import uuid
 import json
 import logging
+import re
 import threading
 import time
 from config import Config, DATA_ROOT
@@ -115,7 +116,7 @@ class SettingsManager:
     
     def _get_connection(self):
         """Get a database connection with proper isolation."""
-        return connect_sqlite(self.db_path, row_factory=True)
+        return connect_sqlite(self.db_path, row_factory=True, typed=True)
     
     # ==================== SETTINGS METHODS ====================
     
@@ -194,7 +195,7 @@ class SettingsManager:
     
     # ==================== USERS METHODS ====================
     
-    def get_user(self, email: str) -> Optional[Dict[str, Any]]:
+    def get_user(self, email: str, safe: bool = False) -> Optional[Dict[str, Any]]:
         """Get a user by email."""
         with _db_lock:
             conn = self._get_connection()
@@ -204,28 +205,12 @@ class SettingsManager:
                 row = cursor.fetchone()
                 if row:
                     user = dict(row)
-                    # Parse JSON fields
-                    if user.get('login_history'):
-                        try:
-                            user['login_history'] = json.loads(user['login_history'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            user['login_history'] = []
-                    if user.get('devices'):
-                        try:
-                            user['devices'] = json.loads(user['devices'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            user['devices'] = []
-                    if user.get('groups'):
-                        try:
-                            user['groups'] = json.loads(user['groups'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            user['groups'] = []
-                    return user
+                    return self._safe_user(user) if safe else user
                 return None
             finally:
                 conn.close()
     
-    def get_all_users(self) -> Dict[str, Dict[str, Any]]:
+    def get_all_users(self, safe: bool = False) -> Dict[str, Dict[str, Any]]:
         """Get all users as a dictionary keyed by email."""
         with _db_lock:
             conn = self._get_connection()
@@ -235,55 +220,87 @@ class SettingsManager:
                 users = {}
                 for row in cursor.fetchall():
                     user = dict(row)
-                    # Parse JSON fields
-                    if user.get('login_history'):
-                        try:
-                            user['login_history'] = json.loads(user['login_history'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            user['login_history'] = []
-                    if user.get('devices'):
-                        try:
-                            user['devices'] = json.loads(user['devices'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            user['devices'] = []
-                    if user.get('groups'):
-                        try:
-                            user['groups'] = json.loads(user['groups'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            user['groups'] = []
-                    users[user['email']] = user
+                    users[user['email']] = self._safe_user(user) if safe else user
                 return users
             finally:
                 conn.close()
-    
+
+    def get_user_by_id(self, user_id: int, safe: bool = False) -> Optional[Dict[str, Any]]:
+        """Get a user by stable numeric identity."""
+        with _db_lock:
+            conn = self._get_connection()
+            try:
+                row = conn.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone()
+                if not row:
+                    return None
+                user = dict(row)
+                return self._safe_user(user) if safe else user
+            finally:
+                conn.close()
+
+    def count_users(self) -> int:
+        """Return the number of stored users without materializing user records."""
+        with _db_lock:
+            conn = self._get_connection()
+            try:
+                return int(conn.execute('SELECT COUNT(*) FROM users').fetchone()[0])
+            finally:
+                conn.close()
+
+    def _safe_user(self, user: Dict[str, Any]) -> Dict[str, Any]:
+        """Return the public user representation without authentication fields."""
+        principal = self.get_principal('user', user['id'])
+        if not principal:
+            return {}
+        return {
+            key: principal[key]
+            for key in (
+                'id', 'email', 'name', 'role', 'groups',
+                'permissions', 'keywords', 'preferences',
+            )
+        }
+
     def save_user(self, email: str, user_data: Dict[str, Any]) -> bool:
         """Save or update a user."""
         with _db_lock:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
-                # Convert JSON fields to strings
-                login_history = json.dumps(user_data.get('login_history', []))
-                devices = json.dumps(user_data.get('devices', []))
-                groups = json.dumps(user_data.get('groups', []))
-                
+                existing = cursor.execute(
+                    'SELECT preferences FROM users WHERE email=?', (email,)
+                ).fetchone()
+                groups = user_data.get('groups', [])
+                preferences = user_data.get('preferences')
+                if preferences is None:
+                    preferences = (
+                        existing['preferences'] if existing
+                        else self._default_preferences_for_groups(conn, groups)
+                    )
                 cursor.execute('''
-                    INSERT OR REPLACE INTO users 
-                    (email, name, password, role, status, access_level,
-                     mfa_enabled, created_at, login_history, devices, groups)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO users
+                    (email, name, password, role, mfa_enabled, mfa_enforced, mfa_secret,
+                     created_at, groups, preferences)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(email) DO UPDATE SET
+                        name=excluded.name, password=excluded.password,
+                        role=excluded.role,
+                        mfa_enabled=excluded.mfa_enabled,
+                        mfa_enforced=excluded.mfa_enforced,
+                        mfa_secret=excluded.mfa_secret,
+                        created_at=excluded.created_at,
+                        groups=excluded.groups,
+                        preferences=excluded.preferences
                 ''', (
                     email,
                     user_data.get('name'),
                     user_data.get('password'),
                     user_data.get('role'),
-                    user_data.get('status'),
-                    user_data.get('accessLevel'),
-                    user_data.get('mfa_enabled', 0),
+                    user_data.get('mfa_enabled', False),
+                    user_data.get('mfa_enforced', False),
+                    user_data.get('mfa_secret'),
                     user_data.get('created_at'),
-                    login_history,
-                    devices,
-                    groups
+                    groups,
+                    preferences,
                 ))
                 conn.commit()
                 return True
@@ -293,6 +310,23 @@ class SettingsManager:
                 return False
             finally:
                 conn.close()
+
+    @staticmethod
+    def _default_preferences_for_groups(conn, group_ids) -> Dict[str, Any]:
+        """Resolve group defaults in ascending group-ID order."""
+        preferences = {'display': {}, 'inbox': {}, 'reports': {}}
+        for group_id in sorted(set(group_ids or [])):
+            row = conn.execute(
+                'SELECT default_preferences FROM groups WHERE id=?', (group_id,)
+            ).fetchone()
+            defaults = row['default_preferences'] if row else None
+            if not isinstance(defaults, dict):
+                continue
+            for section in preferences:
+                values = defaults.get(section)
+                if isinstance(values, dict):
+                    preferences[section].update(values)
+        return preferences
     
     def delete_user(self, email: str) -> bool:
         """Delete a user and all credentials issued to that user."""
@@ -300,10 +334,12 @@ class SettingsManager:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
-                cursor.execute(
-                    "DELETE FROM credentials WHERE principal_type='user' AND principal_id=?",
-                    (email,),
-                )
+                user = cursor.execute('SELECT id FROM users WHERE email=?', (email,)).fetchone()
+                if user:
+                    cursor.execute(
+                        "DELETE FROM credentials WHERE principal_type='user' AND principal_id=?",
+                        (str(user['id']),),
+                    )
                 cursor.execute('DELETE FROM users WHERE email = ?', (email,))
                 conn.commit()
                 return True
@@ -311,6 +347,52 @@ class SettingsManager:
                 logger.error(f"Error deleting user {email}: {e}")
                 conn.rollback()
                 return False
+            finally:
+                conn.close()
+
+    def update_user_by_id(self, user_id: int, user_data: Dict[str, Any]) -> bool:
+        """Update a user while preserving its stable numeric identity."""
+        current = self.get_user_by_id(user_id)
+        if not current:
+            return False
+        current.update(user_data)
+        with _db_lock:
+            conn = self._get_connection()
+            try:
+                conn.execute(
+                    '''UPDATE users SET email=?,name=?,password=?,role=?,mfa_enabled=?,
+                       mfa_enforced=?,mfa_secret=?,created_at=?,
+                       groups=?,preferences=? WHERE id=?''',
+                    (
+                        current['email'], current['name'], current['password'], current.get('role'),
+                        current.get('mfa_enabled', False), current.get('mfa_enforced', False),
+                        current.get('mfa_secret'), current.get('created_at'), current.get('groups', []),
+                        current.get('preferences', {}), user_id,
+                    ),
+                )
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def delete_user_by_id(self, user_id: int) -> bool:
+        """Delete a user and its credentials by stable identity."""
+        with _db_lock:
+            conn = self._get_connection()
+            try:
+                conn.execute(
+                    "DELETE FROM credentials WHERE principal_type='user' AND principal_id=?",
+                    (user_id,),
+                )
+                cursor = conn.execute('DELETE FROM users WHERE id=?', (user_id,))
+                conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                conn.rollback()
+                raise
             finally:
                 conn.close()
     
@@ -324,10 +406,7 @@ class SettingsManager:
                 row = conn.execute('SELECT * FROM groups WHERE name = ?', (name,)).fetchone()
                 if not row:
                     return None
-                group = dict(row)
-                group['permissions'] = json.loads(group.get('permissions') or '[]')
-                group['is_default'] = bool(group.get('is_default'))
-                return group
+                return self._group_with_keyword_details(conn, row)
             finally:
                 conn.close()
 
@@ -339,10 +418,7 @@ class SettingsManager:
                 row = conn.execute('SELECT * FROM groups WHERE id=?', (group_id,)).fetchone()
                 if not row:
                     return None
-                group = dict(row)
-                group['permissions'] = json.loads(group.get('permissions') or '[]')
-                group['is_default'] = bool(group.get('is_default'))
-                return group
+                return self._group_with_keyword_details(conn, row)
             finally:
                 conn.close()
 
@@ -353,9 +429,7 @@ class SettingsManager:
             try:
                 groups = {}
                 for row in conn.execute('SELECT * FROM groups').fetchall():
-                    group = dict(row)
-                    group['permissions'] = json.loads(group.get('permissions') or '[]')
-                    group['is_default'] = bool(group.get('is_default'))
+                    group = self._group_with_keyword_details(conn, row)
                     groups[group['id']] = group
                 return groups
             finally:
@@ -366,6 +440,11 @@ class SettingsManager:
         with _db_lock:
             conn = self._get_connection()
             try:
+                keywords_supplied = 'keywords' in group_data
+                keyword_ids = (
+                    self._resolve_keyword_inputs(conn, group_data['keywords'])
+                    if keywords_supplied else None
+                )
                 if group_id is None:
                     existing = conn.execute(
                         'SELECT id FROM groups WHERE name=?', (group_data.get('name'),)
@@ -374,20 +453,30 @@ class SettingsManager:
                 if group_id is None:
                     cursor = conn.execute(
                         """INSERT INTO groups
-                           (name, description, is_default, permissions)
-                           VALUES (?, ?, ?, ?)""",
+                           (name, description, is_default, permissions,
+                            default_preferences, keywords)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
                         (group_data.get('name'), group_data.get('description'),
-                         int(bool(group_data.get('is_default', False))),
-                         json.dumps(group_data.get('permissions', []))),
+                         bool(group_data.get('is_default', False)),
+                         group_data.get('permissions', []),
+                         group_data.get('default_preferences', {
+                             'display': {}, 'inbox': {}, 'reports': {}
+                         }),
+                         keyword_ids or []),
                     )
                     group_id = cursor.lastrowid
                 else:
                     conn.execute(
-                        """UPDATE groups SET name=?, description=?, is_default=?, permissions=?
+                        """UPDATE groups SET name=?, description=?, is_default=?, permissions=?,
+                           default_preferences=?, keywords=?
                            WHERE id=?""",
                         (group_data.get('name'), group_data.get('description'),
-                         int(bool(group_data.get('is_default', False))),
-                         json.dumps(group_data.get('permissions', [])), group_id),
+                         bool(group_data.get('is_default', False)),
+                         group_data.get('permissions', []),
+                         group_data.get('default_preferences', {
+                             'display': {}, 'inbox': {}, 'reports': {}
+                         }),
+                         keyword_ids if keywords_supplied else group_data.get('keywords', []), group_id),
                     )
                 conn.commit()
                 return group_id
@@ -395,6 +484,87 @@ class SettingsManager:
                 logger.error(f"Error saving group {group_id}: {e}")
                 conn.rollback()
                 return -1
+            finally:
+                conn.close()
+
+    @staticmethod
+    def _keyword_object(row):
+        return dict(row) if row else None
+
+    @classmethod
+    def _group_with_keyword_details(cls, conn, row):
+        group = dict(row)
+        keyword_ids = group.get('keywords') or []
+        if not keyword_ids:
+            group['keyword_details'] = []
+            return group
+        placeholders = ','.join('?' for _ in keyword_ids)
+        details = {
+            keyword['id']: dict(keyword)
+            for keyword in conn.execute(
+                f'SELECT * FROM keywords WHERE id IN ({placeholders})', keyword_ids
+            ).fetchall()
+        }
+        group['keyword_details'] = [details[keyword_id] for keyword_id in keyword_ids if keyword_id in details]
+        return group
+
+    @staticmethod
+    def _resolve_keyword_inputs(conn, values):
+        if not isinstance(values, list):
+            raise ValueError('keywords must be an array')
+        keyword_ids = []
+        combinations = set()
+        for value in values:
+            if isinstance(value, bool):
+                raise ValueError('keyword IDs must be integers')
+            if isinstance(value, int):
+                row = conn.execute('SELECT * FROM keywords WHERE id=?', (value,)).fetchone()
+                if not row:
+                    raise ValueError(f'Keyword {value} does not exist')
+                keyword_id = value
+                combination = (row['pattern'], row['match_type'], bool(row['case_sensitive']))
+            elif isinstance(value, dict) and 'id' not in value:
+                pattern = value.get('pattern')
+                match_type = value.get('match_type', 'literal')
+                case_sensitive = value.get('case_sensitive', False)
+                if not isinstance(pattern, str) or not pattern.strip():
+                    raise ValueError('keyword pattern is required')
+                if match_type not in {'literal', 'regex'} or not isinstance(case_sensitive, bool):
+                    raise ValueError('Invalid keyword matching options')
+                combination = (pattern, match_type, case_sensitive)
+                cursor = conn.execute(
+                    '''INSERT INTO keywords(pattern,match_type,case_sensitive)
+                       VALUES(?,?,?)''', combination,
+                )
+                keyword_id = cursor.lastrowid
+            else:
+                raise ValueError('keywords entries must be IDs or new keyword objects')
+            if keyword_id in keyword_ids or combination in combinations:
+                raise ValueError('Duplicate keyword in group')
+            keyword_ids.append(keyword_id)
+            combinations.add(combination)
+        return keyword_ids
+
+    def delete_keyword(self, keyword_id: int) -> bool:
+        """Delete a keyword globally and remove all group references."""
+        with _db_lock:
+            conn = self._get_connection()
+            try:
+                if not conn.execute('SELECT 1 FROM keywords WHERE id=?', (keyword_id,)).fetchone():
+                    return False
+                for row in conn.execute('SELECT id,keywords FROM groups').fetchall():
+                    keyword_ids = row['keywords'] or []
+                    if keyword_id in keyword_ids:
+                        conn.execute(
+                            'UPDATE groups SET keywords=? WHERE id=?',
+                            ([value for value in keyword_ids if value != keyword_id], row['id']),
+                        )
+                conn.execute('DELETE FROM keywords WHERE id=?', (keyword_id,))
+                conn.commit()
+                return True
+            except Exception:
+                conn.rollback()
+                raise
             finally:
                 conn.close()
 
@@ -660,13 +830,7 @@ class SettingsManager:
                     )
                 query += ' ORDER BY channels.id'
                 cursor.execute(query, parameters)
-                channels = []
-                for row in cursor.fetchall():
-                    channel = dict(row)
-                    # Convert deleted integer to boolean for compatibility
-                    channel['deleted'] = bool(channel.get('deleted', 0))
-                    channels.append(channel)
-                return channels
+                return [dict(row) for row in cursor.fetchall()]
             finally:
                 conn.close()
     
@@ -688,10 +852,7 @@ class SettingsManager:
                 cursor.execute(query, parameters)
                 row = cursor.fetchone()
                 if row:
-                    channel = dict(row)
-                    # Convert deleted integer to boolean for compatibility
-                    channel['deleted'] = bool(channel.get('deleted', 0))
-                    return channel
+                    return dict(row)
                 return None
             finally:
                 conn.close()
@@ -719,10 +880,7 @@ class SettingsManager:
                 cursor.execute(query, parameters)
                 row = cursor.fetchone()
                 if row:
-                    channel = dict(row)
-                    # Convert deleted integer to boolean for compatibility
-                    channel['deleted'] = bool(channel.get('deleted', 0))
-                    return channel
+                    return dict(row)
                 return None
             finally:
                 conn.close()
@@ -746,7 +904,8 @@ class SettingsManager:
                         car=?, driver=?, person=?, tag=?, mac=?, audio_stream_enabled=?,
                         threshold=?, silence=?, min_rec=?, max_rec=?, audio_gain=?,
                         frequency=?, tone=?, type=?, deleted=?, audio_stream_port=?,
-                        speaker_enabled=?, speaker_volume=? WHERE id=?
+                        speaker_enabled=?, speaker_volume=?, device_hostname=?,
+                        device_ip=? WHERE id=?
                     ''', (
                         channel_data.get('name'),
                         channel_data.get('status'),
@@ -774,6 +933,8 @@ class SettingsManager:
                         channel_data.get('audio_stream_port'),
                         channel_data.get('speaker_enabled', 0),
                         channel_data.get('speaker_volume'),
+                        channel_data.get('device_hostname'),
+                        channel_data.get('device_ip'),
                         channel_data['id']
                     ))
                     conn.commit()
@@ -795,8 +956,9 @@ class SettingsManager:
                             INSERT INTO channels (name, status, model, src_language, target_language,
                             color, background_color, team_color, car, driver, person, tag, mac,
                             audio_stream_enabled, threshold, silence, min_rec, max_rec, audio_gain,
-                            frequency, tone, type, deleted, audio_stream_port, speaker_enabled, speaker_volume)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            frequency, tone, type, deleted, audio_stream_port, speaker_enabled,
+                            speaker_volume, device_hostname, device_ip)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             channel_data.get('name'),
                             channel_data.get('status'),
@@ -823,7 +985,9 @@ class SettingsManager:
                             channel_data.get('deleted', 0),
                             channel_data.get('audio_stream_port'),
                             channel_data.get('speaker_enabled', 0),
-                            channel_data.get('speaker_volume')
+                            channel_data.get('speaker_volume'),
+                            channel_data.get('device_hostname'),
+                            channel_data.get('device_ip')
                         ))
                         lastrowid = cursor.lastrowid
                         default_group = cursor.execute(
@@ -882,7 +1046,7 @@ class SettingsManager:
         """Hash a plaintext credential for lookup and persistence."""
         return hashlib.sha256(token.encode('utf-8')).hexdigest()
 
-    def issue_credential(self, principal_type: str, principal_id: str,
+    def issue_credential(self, principal_type: str, principal_id: Union[int, str],
                          expires_at: Optional[str] = None,
                          token: Optional[str] = None) -> tuple[str, str]:
         """Issue and persist a hashed credential."""
@@ -891,11 +1055,21 @@ class SettingsManager:
         with _db_lock:
             conn = self._get_connection()
             try:
+                if principal_type == 'user':
+                    user = conn.execute(
+                        'SELECT id FROM users WHERE id=? OR email=?',
+                        (principal_id, str(principal_id)),
+                    ).fetchone()
+                    if not user:
+                        raise ValueError('Unknown user principal')
+                    principal_id = user['id']
+                else:
+                    principal_id = int(principal_id)
                 conn.execute(
                     """INSERT INTO credentials
                        (id, principal_type, principal_id, token_hash, created_at, expires_at)
                        VALUES (?, ?, ?, ?, ?, ?)""",
-                    (credential_id, principal_type, str(principal_id),
+                    (credential_id, principal_type, principal_id,
                      self.hash_credential(token), datetime.now(timezone.utc).isoformat(),
                      expires_at),
                 )
@@ -954,15 +1128,15 @@ class SettingsManager:
         credential, _ = self.inspect_credential(token)
         return credential
 
-    def get_principal(self, principal_type: str, principal_id: str) -> Optional[Dict[str, Any]]:
+    def get_principal(self, principal_type: str, principal_id: int) -> Optional[Dict[str, Any]]:
         """Materialize the current authorization principal for a credential."""
         with _db_lock:
             conn = self._get_connection()
             try:
                 if principal_type == 'user':
                     row = conn.execute(
-                        """SELECT email, name, role, status, access_level, groups
-                           FROM users WHERE email=?""",
+                        """SELECT id, email, name, role, groups, preferences
+                           FROM users WHERE id=?""",
                         (principal_id,),
                     ).fetchone()
                     if not row:
@@ -970,13 +1144,28 @@ class SettingsManager:
                     principal = dict(row)
                     group_ids = self._json_list(principal.pop('groups', None))
                     permissions = self._group_permissions(conn, group_ids)
+                    groups = []
+                    keywords = {}
+                    if group_ids:
+                        placeholders = ','.join('?' for _ in group_ids)
+                        group_rows = conn.execute(
+                            f'SELECT * FROM groups WHERE id IN ({placeholders})', group_ids
+                        ).fetchall()
+                        by_id = {
+                            group['id']: self._group_with_keyword_details(conn, group)
+                            for group in group_rows
+                        }
+                        groups = [by_id[group_id] for group_id in group_ids if group_id in by_id]
+                        for group in groups:
+                            for keyword in group['keyword_details']:
+                                keywords[keyword['id']] = keyword
                     principal.update({
-                        'id': principal['email'],
                         'type': 'user',
-                        'groups': group_ids,
+                        'groups': groups,
                         'permissions': permissions,
+                        'keywords': [keywords[keyword_id] for keyword_id in sorted(keywords)],
                         'owner_ids': None if principal.get('role') == 'admin' else [
-                            f"user:{principal['email']}",
+                            f"user:{principal['id']}",
                             *(f'group:{group_id}' for group_id in group_ids),
                         ],
                     })
@@ -1068,7 +1257,7 @@ class SettingsManager:
 
     def delete_expired_credentials(self, now: Optional[str] = None,
                                    principal_type: Optional[str] = None,
-                                   principal_id: Optional[str] = None) -> int:
+                                   principal_id: Optional[int] = None) -> int:
         """Delete expired credentials and return the number removed."""
         now = now or datetime.now(timezone.utc).isoformat()
         where = 'expires_at IS NOT NULL AND expires_at <= ?'
@@ -1078,7 +1267,7 @@ class SettingsManager:
             parameters.append(principal_type)
         if principal_id is not None:
             where += ' AND principal_id=?'
-            parameters.append(str(principal_id))
+            parameters.append(principal_id)
         with _db_lock:
             conn = self._get_connection()
             try:
@@ -1103,7 +1292,7 @@ class SettingsManager:
             finally:
                 conn.close()
 
-    def has_current_credential(self, principal_type: str, principal_id: str) -> bool:
+    def has_current_credential(self, principal_type: str, principal_id: int) -> bool:
         """Return whether a principal has at least one unexpired credential."""
         now = datetime.now(timezone.utc).isoformat()
         with _db_lock:
@@ -1114,51 +1303,11 @@ class SettingsManager:
                        WHERE principal_type=? AND principal_id=?
                          AND (expires_at IS NULL OR expires_at > ?)
                        LIMIT 1""",
-                    (principal_type, str(principal_id), now),
+                    (principal_type, principal_id, now),
                 ).fetchone() is not None
             finally:
                 conn.close()
 
-    # ==================== PAGINATION PREFERENCES METHODS ====================
-    
-    def get_pagination_prefs(self, email: str) -> Optional[Dict[str, Any]]:
-        """Get pagination preferences for a user."""
-        with _db_lock:
-            conn = self._get_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute('SELECT * FROM pagination_preferences WHERE email = ?', (email,))
-                row = cursor.fetchone()
-                return dict(row) if row else None
-            finally:
-                conn.close()
-    
-    def save_pagination_prefs(self, email: str, prefs: Dict[str, Any]) -> bool:
-        """Save pagination preferences for a user."""
-        with _db_lock:
-            conn = self._get_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute('''
-                    INSERT OR REPLACE INTO pagination_preferences 
-                    (email, records_per_page, current_page, reverse_sort, show_full_timestamps)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (
-                    email,
-                    prefs.get('recordsPerPage'),
-                    prefs.get('currentPage'),
-                    prefs.get('reverseSort', 0),
-                    prefs.get('showFullTimestamps', 0)
-                ))
-                conn.commit()
-                return True
-            except Exception as e:
-                logger.error(f"Error saving pagination prefs for {email}: {e}")
-                conn.rollback()
-                return False
-            finally:
-                conn.close()
-    
     # ==================== BRANDING METHODS ====================
     
     def get_branding(self) -> Optional[Dict[str, Any]]:
@@ -1170,18 +1319,7 @@ class SettingsManager:
                 cursor.execute('SELECT * FROM branding ORDER BY id DESC LIMIT 1')
                 row = cursor.fetchone()
                 if row:
-                    branding = dict(row)
-                    if branding.get('brand_colors'):
-                        try:
-                            branding['brand_colors'] = json.loads(branding['brand_colors'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            branding['brand_colors'] = {}
-                    if branding.get('assets'):
-                        try:
-                            branding['assets'] = json.loads(branding['assets'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            branding['assets'] = {}
-                    return branding
+                    return dict(row)
                 return None
             finally:
                 conn.close()
@@ -1192,9 +1330,6 @@ class SettingsManager:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
-                brand_colors = json.dumps(branding_data.get('brand_colors', {}))
-                assets = json.dumps(branding_data.get('assets', {}))
-
                 cursor.execute('SELECT id FROM branding ORDER BY id DESC LIMIT 1')
                 existing = cursor.fetchone()
                 if existing:
@@ -1205,9 +1340,9 @@ class SettingsManager:
                     ''', (
                         branding_data.get('organization_name'),
                         branding_data.get('tagline'),
-                        brand_colors,
+                        branding_data.get('brand_colors', {}),
                         branding_data.get('font'),
-                        assets,
+                        branding_data.get('assets', {}),
                         existing['id']
                     ))
                 else:
@@ -1217,9 +1352,9 @@ class SettingsManager:
                     ''', (
                         branding_data.get('organization_name'),
                         branding_data.get('tagline'),
-                        brand_colors,
+                        branding_data.get('brand_colors', {}),
                         branding_data.get('font'),
-                        assets
+                        branding_data.get('assets', {})
                     ))
                 conn.commit()
                 return True
@@ -1231,6 +1366,44 @@ class SettingsManager:
                 conn.close()
     
     # ==================== HALLUCINATIONS METHODS ====================
+
+    @staticmethod
+    def _validate_hallucination(data: Any, allow_id: bool = False) -> Dict[str, Any]:
+        """Validate and normalize a hallucination pattern payload."""
+        if not isinstance(data, dict):
+            raise ValueError('Hallucination pattern must be an object')
+        allowed = {'pattern', 'match_type', 'case_sensitive'}
+        if allow_id:
+            allowed.add('id')
+        unknown = sorted(set(data) - allowed)
+        if unknown:
+            raise ValueError(f"Unknown hallucination field(s): {', '.join(unknown)}")
+
+        pattern = data.get('pattern')
+        match_type = data.get('match_type', 'literal')
+        case_sensitive = data.get('case_sensitive', False)
+        if not isinstance(pattern, str) or not pattern or len(pattern) > 4096:
+            raise ValueError('Hallucination pattern must contain 1-4096 characters')
+        if match_type not in {'literal', 'regex'}:
+            raise ValueError('match_type must be literal or regex')
+        if not isinstance(case_sensitive, bool):
+            raise ValueError('case_sensitive must be a boolean')
+        if match_type == 'regex':
+            try:
+                re.compile(pattern)
+            except re.error as error:
+                raise ValueError(f'Invalid regular expression: {error}') from error
+
+        normalized = {
+            'pattern': pattern,
+            'match_type': match_type,
+            'case_sensitive': case_sensitive,
+        }
+        if allow_id and 'id' in data:
+            if isinstance(data['id'], bool) or not isinstance(data['id'], int):
+                raise ValueError('Hallucination id must be an integer')
+            normalized['id'] = data['id']
+        return normalized
     
     def get_all_hallucinations(self) -> List[Dict[str, Any]]:
         """Get all hallucinations."""
@@ -1239,16 +1412,7 @@ class SettingsManager:
             try:
                 cursor = conn.cursor()
                 cursor.execute('SELECT * FROM hallucinations ORDER BY id')
-                results = []
-                for row in cursor.fetchall():
-                    data = dict(row)
-                    if data.get('data'):
-                        try:
-                            data['data'] = json.loads(data['data'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            pass
-                    results.append(data)
-                return results
+                return [dict(row) for row in cursor.fetchall()]
             finally:
                 conn.close()
     
@@ -1274,14 +1438,88 @@ class SettingsManager:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
-                data_str = json.dumps(data) if not isinstance(data, str) else data
-                cursor.execute('INSERT INTO hallucinations (data) VALUES (?)', (data_str,))
+                pattern_data = self._validate_hallucination(data)
+                cursor.execute(
+                    '''INSERT INTO hallucinations (pattern, match_type, case_sensitive)
+                       VALUES (?, ?, ?)''',
+                    (
+                        pattern_data['pattern'],
+                        pattern_data['match_type'],
+                        pattern_data['case_sensitive'],
+                    ),
+                )
                 conn.commit()
                 return cursor.lastrowid
+            except ValueError:
+                conn.rollback()
+                raise
             except Exception as e:
                 logger.error(f"Error saving hallucination: {e}")
                 conn.rollback()
                 return -1
+            finally:
+                conn.close()
+
+    def replace_hallucinations(self, patterns: Any) -> List[Dict[str, Any]]:
+        """Apply the complete collection sent to ``PATCH /settings/audio-processing``.
+
+        Patterns carrying an ``id`` update that existing row, patterns without
+        an ``id`` are inserted, and existing rows omitted from the submitted
+        collection are deleted. The transaction prevents the category endpoint
+        from exposing a partially replaced collection if validation or a write
+        fails.
+        """
+        if not isinstance(patterns, list):
+            raise ValueError('hallucination_patterns must be an array')
+        normalized = [self._validate_hallucination(item, allow_id=True) for item in patterns]
+        supplied_ids = [item['id'] for item in normalized if 'id' in item]
+        if len(supplied_ids) != len(set(supplied_ids)):
+            raise ValueError('Hallucination ids cannot be duplicated')
+
+        with _db_lock:
+            conn = self._get_connection()
+            try:
+                cursor = conn.cursor()
+                existing_ids = {
+                    row['id'] for row in cursor.execute('SELECT id FROM hallucinations').fetchall()
+                }
+                missing_ids = sorted(set(supplied_ids) - existing_ids)
+                if missing_ids:
+                    raise ValueError(f"Unknown hallucination id(s): {', '.join(map(str, missing_ids))}")
+
+                for item in normalized:
+                    values = (item['pattern'], item['match_type'], item['case_sensitive'])
+                    if 'id' in item:
+                        cursor.execute(
+                            '''UPDATE hallucinations
+                               SET pattern = ?, match_type = ?, case_sensitive = ?
+                               WHERE id = ?''',
+                            (*values, item['id']),
+                        )
+                    else:
+                        cursor.execute(
+                            '''INSERT INTO hallucinations (pattern, match_type, case_sensitive)
+                               VALUES (?, ?, ?)''',
+                            values,
+                        )
+                        item['id'] = cursor.lastrowid
+
+                desired_ids = [item['id'] for item in normalized]
+                if desired_ids:
+                    placeholders = ','.join('?' for _ in desired_ids)
+                    cursor.execute(
+                        f'DELETE FROM hallucinations WHERE id NOT IN ({placeholders})',
+                        desired_ids,
+                    )
+                else:
+                    cursor.execute('DELETE FROM hallucinations')
+                conn.commit()
+                return [dict(row) for row in cursor.execute(
+                    'SELECT * FROM hallucinations ORDER BY id'
+                ).fetchall()]
+            except Exception:
+                conn.rollback()
+                raise
             finally:
                 conn.close()
     
@@ -1436,16 +1674,7 @@ class SettingsManager:
             try:
                 cursor = conn.cursor()
                 cursor.execute('SELECT * FROM recorders_inventory ORDER BY id')
-                results = []
-                for row in cursor.fetchall():
-                    data = dict(row)
-                    if data.get('data'):
-                        try:
-                            data['data'] = json.loads(data['data'])
-                        except (json.JSONDecodeError, ValueError, TypeError):
-                            pass
-                    results.append(data)
-                return results
+                return [dict(row) for row in cursor.fetchall()]
             finally:
                 conn.close()
     
@@ -1455,26 +1684,23 @@ class SettingsManager:
             conn = self._get_connection()
             try:
                 cursor = conn.cursor()
-                data_str = json.dumps(recorder_data) if not isinstance(recorder_data, str) else recorder_data
-                
                 # Check if recorder with same port already exists
                 port = recorder_data.get('port') if isinstance(recorder_data, dict) else None
                 if port:
                     # Search for existing recorder with same port
                     cursor.execute('SELECT id, data FROM recorders_inventory')
                     for row in cursor.fetchall():
-                        try:
-                            existing_data = json.loads(row['data']) if isinstance(row['data'], str) else row['data']
-                            if isinstance(existing_data, dict) and existing_data.get('port') == port:
-                                # Update existing record
-                                cursor.execute('UPDATE recorders_inventory SET data = ? WHERE id = ?', (data_str, row['id']))
-                                conn.commit()
-                                return row['id']
-                        except (json.JSONDecodeError, TypeError):
-                            continue
+                        existing_data = row['data']
+                        if isinstance(existing_data, dict) and existing_data.get('port') == port:
+                            cursor.execute(
+                                'UPDATE recorders_inventory SET data = ? WHERE id = ?',
+                                (recorder_data, row['id']),
+                            )
+                            conn.commit()
+                            return row['id']
                 
                 # No existing recorder found, insert new one
-                cursor.execute('INSERT INTO recorders_inventory (data) VALUES (?)', (data_str,))
+                cursor.execute('INSERT INTO recorders_inventory (data) VALUES (?)', (recorder_data,))
                 conn.commit()
                 return cursor.lastrowid
             except Exception as e:
@@ -1494,14 +1720,11 @@ class SettingsManager:
                 cursor.execute('SELECT id, data FROM recorders_inventory')
                 deleted = False
                 for row in cursor.fetchall():
-                    try:
-                        data = json.loads(row['data']) if isinstance(row['data'], str) else row['data']
-                        if isinstance(data, dict) and data.get('port') == port:
-                            cursor.execute('DELETE FROM recorders_inventory WHERE id = ?', (row['id'],))
-                            deleted = True
-                            break
-                    except (json.JSONDecodeError, TypeError):
-                        continue
+                    data = row['data']
+                    if isinstance(data, dict) and data.get('port') == port:
+                        cursor.execute('DELETE FROM recorders_inventory WHERE id = ?', (row['id'],))
+                        deleted = True
+                        break
                 
                 if deleted:
                     conn.commit()

@@ -18,7 +18,7 @@ def _permissions(data):
 @groups_bp.route('/groups', methods=['GET'])
 @require_admin
 def get_groups():
-    return jsonify(_settings_manager.get_all_groups()), 200
+    return jsonify(list(_settings_manager.get_all_groups().values())), 200
 
 @groups_bp.route('/groups/<int:group_id>', methods=['GET'])
 @require_admin
@@ -41,13 +41,17 @@ def create_group():
         'description': data.get('description', ''),
         'is_default': bool(data.get('is_default', False)),
         'permissions': permissions,
+        'default_preferences': data.get('default_preferences', {
+            'display': {}, 'inbox': {}, 'reports': {}
+        }),
+        'keywords': data.get('keywords', []),
     })
     if group_id < 0:
         return jsonify({'error': 'Unable to create group'}), 500
     return jsonify(_settings_manager.get_group_by_id(group_id)), 201
 
 
-@groups_bp.route('/groups/<int:group_id>', methods=['PUT'])
+@groups_bp.route('/groups/<int:group_id>', methods=['PATCH'])
 @require_admin
 def update_group(group_id):
     group = _settings_manager.get_group_by_id(group_id)
@@ -59,7 +63,7 @@ def update_group(group_id):
         if permissions is None:
             return jsonify({'error': 'permissions must be a list of strings'}), 400
         group['permissions'] = permissions
-    for field in ('name', 'description', 'is_default'):
+    for field in ('name', 'description', 'is_default', 'default_preferences', 'keywords'):
         if field in data:
             group[field] = data[field]
     if not str(group.get('name') or '').strip():
@@ -76,4 +80,12 @@ def delete_group(group_id):
         return jsonify({'error': 'Group not found'}), 404
     if not _settings_manager.delete_group(group_id):
         return jsonify({'error': 'Group is default or referenced and cannot be deleted'}), 409
+    return '', 204
+
+
+@groups_bp.route('/keywords/<int:keyword_id>', methods=['DELETE'])
+@require_admin
+def delete_keyword(keyword_id):
+    if not _settings_manager.delete_keyword(keyword_id):
+        return jsonify({'error': 'Keyword not found'}), 404
     return '', 204

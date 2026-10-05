@@ -10,6 +10,16 @@ def test_credential_repository_hashes_and_resolves_credentials(
 ):
     repository = initialized_settings_manager
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    repository.save_user(
+        "member@example.com",
+        {
+            "name": "Member",
+            "password": "unused",
+            "role": "member",
+            "groups": [],
+        },
+    )
+    user_id = repository.get_user("member@example.com")["id"]
 
     raw_token, credential_id = repository.issue_credential(
         "user", "member@example.com", expires_at
@@ -18,7 +28,7 @@ def test_credential_repository_hashes_and_resolves_credentials(
 
     assert credential["id"] == credential_id
     assert credential["principal_type"] == "user"
-    assert credential["principal_id"] == "member@example.com"
+    assert credential["principal_id"] == user_id
     connection = sqlite3.connect(repository.db_path)
     persisted = connection.execute(
         "SELECT token_hash FROM credentials WHERE id=?", (credential_id,)

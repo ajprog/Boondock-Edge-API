@@ -45,8 +45,8 @@ QUEUE_HISTORY_JSON = os.path.join(_DB_DIR, 'queue_history.json')
 # Default file contents
 DEFAULT_SETTINGS = {
     "event_name": "default",
-    "global_model": "base.en",
-    "global_target_language": "english",
+    "model": "base.en",
+    "target_language": "english",
     "global_transcribe_local": True,
     "global_transcribe_openai": False,
     "global_hallucination": True,
@@ -111,7 +111,6 @@ DEFAULT_USERS = {
         "password": "hashed_password_here",
         "role": "admin",
         "profile": "Admin",
-        "status": "Active",
         "mfa_enabled": False,
         "created_at": datetime.utcnow().isoformat() + 'Z'
     }

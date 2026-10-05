@@ -1,11 +1,4 @@
-"""
-Hallucinations management routes.
-Handles creation, listing, and deletion of hallucination entries.
-"""
-import json
-import os
-import logging
-from datetime import datetime
+"""Dedicated CRUD operations for hallucination patterns."""
 from flask import Blueprint, jsonify, request
 from flasgger import swag_from
 from ..middleware.auth_middleware import require_admin
@@ -21,155 +14,103 @@ hallucinations_bp = Blueprint('hallucinations', __name__)
 @require_admin
 @swag_from({
     'tags': ['Hallucinations'],
-    'summary': 'Create a hallucination entry',
-    'parameters': [
-        {
-            'name': 'body',
-            'in': 'body',
-            'required': True,
-            'schema': {
-                'type': 'object',
-                'required': ['text'],
-                'properties': {
-                    'text': {'type': 'string'},
-                    'type': {'type': 'array', 'items': {'type': 'string'}},
-                    'created_by': {'type': 'string'}
-                }
-            }
-        }
-    ],
+    'summary': 'Create a hallucination pattern',
+    'description': (
+        'Creates one literal or Python-compatible regular-expression pattern. '
+        'Literal, case-insensitive matching is used by default.'
+    ),
+    'parameters': [{
+        'name': 'body',
+        'in': 'body',
+        'required': True,
+        'schema': {
+            'type': 'object',
+            'required': ['pattern'],
+            'properties': {
+                'pattern': {'type': 'string', 'minLength': 1, 'maxLength': 4096},
+                'match_type': {
+                    'type': 'string',
+                    'enum': ['literal', 'regex'],
+                    'default': 'literal',
+                },
+                'case_sensitive': {'type': 'boolean', 'default': False},
+            },
+        },
+    }],
     'responses': {
-        '201': {'description': 'Hallucination created successfully'},
-        '400': {'description': 'Bad request'}
-    }
+        '201': {'description': 'Hallucination pattern created'},
+        '400': {'description': 'Invalid pattern payload'},
+        '500': {'description': 'Server error'},
+    },
 })
 def create_hallucination():
-    """
-    Expects JSON body with:
-      - text (string): The hallucination text to insert.
-      - (optional) tags (list of strings)
-      - (optional) created_by (string)
-    """
-    data = request.get_json()
-    if not isinstance(data, dict):
-        return jsonify({'error': 'Invalid JSON'}), 400
-
-    text = data.get('text', '').strip()
-    if not text:
-        return jsonify({'error': 'Missing required field: text'}), 400
-
-    # Load existing hallucinations
-    hallucinations = _settings_manager.get_all_hallucinations()
-    
-    new_id = max((h.get('id', 0) for h in hallucinations), default=0) + 1
-
-    hallucination = {
-        'id': new_id,
-        'text': text,
-        'type': data.get('type', []),
-        'created_by': data.get('created_by', ''),
-        'created_at': datetime.utcnow().isoformat() + 'Z'
-    }
-
-    # Save using SettingsManager
-    _settings_manager.save_hallucination(hallucination)
-
-    return jsonify(hallucination), 201
+    """Create and return one explicit hallucination pattern."""
+    try:
+        data = request.get_json(silent=True)
+        pattern_id = _settings_manager.save_hallucination(data)
+        if pattern_id < 0:
+            raise RuntimeError('Failed to save hallucination pattern')
+        pattern = next(
+            item for item in _settings_manager.get_all_hallucinations()
+            if item['id'] == pattern_id
+        )
+        return jsonify(pattern), 201
+    except ValueError as error:
+        return jsonify({'error': str(error)}), 400
+    except Exception as error:
+        return jsonify({'error': str(error)}), 500
 
 
 @hallucinations_bp.route('/hallucinations', methods=['GET'])
 @require_admin
 @swag_from({
     'tags': ['Hallucinations'],
-    'summary': 'List hallucinations',
-    'parameters': [
-        {
-            'name': 'search',
-            'in': 'query',
-            'type': 'string',
-            'required': False,
-            'description': 'Search string to filter hallucinations'
-        },
-        {
-            'name': 'type',
-            'in': 'query',
-            'type': 'string',
-            'required': False,
-            'description': 'Filter by type'
-        }
-    ],
+    'summary': 'List hallucination patterns',
     'responses': {
-        '200': {'description': 'List of hallucinations'}
-    }
+        '200': {
+            'description': 'Complete hallucination-pattern collection',
+            'schema': {
+                'type': 'array',
+                'items': {
+                    'type': 'object',
+                    'properties': {
+                        'id': {'type': 'integer'},
+                        'pattern': {'type': 'string'},
+                        'match_type': {
+                            'type': 'string',
+                            'enum': ['literal', 'regex'],
+                        },
+                        'case_sensitive': {'type': 'boolean'},
+                    },
+                },
+            },
+        },
+    },
 })
 def list_hallucinations():
-    """
-    Returns all hallucinations, with optional search by text and filter by type.
-    Query parameters:
-      - search: string to filter hallucination.text (case-insensitive)
-      - type: exact match against hallucination.type; 'All' or missing = no filter
-    """
-    # Load hallucinations from database
-    raw = _settings_manager.get_all_hallucinations()
-
-    # Each DB row has the shape {id: <row_id>, data: {id, text, type, ...}}.
-    # Flatten so callers always receive {id, text, type, ...} at the top level.
-    hallucinations = []
-    for h in raw:
-        inner = h.get('data')
-        if isinstance(inner, dict):
-            item = dict(inner)
-            item['id'] = h['id']  # use the stable DB row id
-            hallucinations.append(item)
-        else:
-            hallucinations.append(h)
-
-    search = request.args.get('search', '').strip().lower()
-    halluc_type = request.args.get('type', '').strip()
-
-    if search:
-        hallucinations = [h for h in hallucinations if search in h.get('text', '').lower()]
-    if halluc_type and halluc_type.lower() != 'all':
-        hallucinations = [
-            h for h in hallucinations
-            if h.get('type') == halluc_type
-            or (isinstance(h.get('type'), list) and halluc_type in h.get('type'))
-        ]
-
-    return jsonify(hallucinations), 200
+    """Return all explicit hallucination patterns."""
+    return jsonify(_settings_manager.get_all_hallucinations()), 200
 
 
 @hallucinations_bp.route('/hallucinations/<int:hallucinations_id>', methods=['DELETE'])
 @require_admin
 @swag_from({
     'tags': ['Hallucinations'],
-    'summary': 'Delete a hallucination',
-    'parameters': [
-        {
-            'name': 'hallucinations_id',
-            'in': 'path',
-            'type': 'integer',
-            'required': True,
-            'description': 'Hallucination ID'
-        }
-    ],
+    'summary': 'Delete a hallucination pattern',
+    'parameters': [{
+        'name': 'hallucinations_id',
+        'in': 'path',
+        'type': 'integer',
+        'required': True,
+        'description': 'Stable hallucination-pattern ID',
+    }],
     'responses': {
-        '200': {'description': 'Hallucination deleted successfully'},
-        '404': {'description': 'Hallucination not found'}
-    }
+        '204': {'description': 'Hallucination pattern deleted'},
+        '404': {'description': 'Hallucination pattern not found'},
+    },
 })
 def delete_hallucination(hallucinations_id):
     """Delete a hallucination entry by ID."""
-    # Check if hallucination exists
-    hallucinations = _settings_manager.get_all_hallucinations()
-    hallucination = next((h for h in hallucinations if h.get('id') == hallucinations_id), None)
-    if not hallucination:
+    if not _settings_manager.delete_hallucination(hallucinations_id):
         return jsonify({'error': 'Hallucination not found'}), 404
-
-    # Delete using SettingsManager
-    success = _settings_manager.delete_hallucination(hallucinations_id)
-    if success:
-        return jsonify({'message': 'Hallucination deleted'}), 200
-    else:
-        return jsonify({'error': 'Failed to delete hallucination'}), 500
-
+    return '', 204
