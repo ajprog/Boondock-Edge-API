@@ -71,6 +71,7 @@ def _default_preferences(db, admin=False, pagination=None):
         "sort_direction": "oldest_first" if pagination.get("reverse_sort") else "newest_first",
         "show_full_timestamps": bool(pagination.get("show_full_timestamps", False)),
         "show_time": True, "show_car": False, "show_channel": True, "show_person": False,
+        "time_format": _setting(db, "cached_time_format", "24h")
     }
     if admin:
         inbox.update({
@@ -78,7 +79,6 @@ def _default_preferences(db, admin=False, pagination=None):
             "show_hallucinations": not bool(_setting(db, "global_hallucination", False)),
         })
     return {
-        "display": {"time_format": _setting(db, "cached_time_format", "24h")},
         "inbox": inbox,
         "reports": {"density": _setting(db, "reports_density_mode", "comfortable")},
     }
@@ -89,7 +89,7 @@ def _upgrade_groups(db):
     if "default_preferences" not in columns:
         db.execute("ALTER TABLE groups ADD COLUMN default_preferences JSON NOT NULL DEFAULT '{}'")
         db.execute("UPDATE groups SET default_preferences=?",
-                   (json.dumps({"display": {}, "inbox": {}, "reports": {}}),))
+                   (json.dumps({"inbox": {}, "reports": {}}),))
     if "keywords" not in columns:
         db.execute("ALTER TABLE groups ADD COLUMN keywords JSON NOT NULL DEFAULT '[]'")
     db.execute("""CREATE TABLE IF NOT EXISTS keywords (

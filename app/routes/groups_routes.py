@@ -42,7 +42,7 @@ def create_group():
         'is_default': bool(data.get('is_default', False)),
         'permissions': permissions,
         'default_preferences': data.get('default_preferences', {
-            'display': {}, 'inbox': {}, 'reports': {}
+            'inbox': {}, 'reports': {}
         }),
         'keywords': data.get('keywords', []),
     })

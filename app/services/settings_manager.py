@@ -314,7 +314,7 @@ class SettingsManager:
     @staticmethod
     def _default_preferences_for_groups(conn, group_ids) -> Dict[str, Any]:
         """Resolve group defaults in ascending group-ID order."""
-        preferences = {'display': {}, 'inbox': {}, 'reports': {}}
+        preferences = {'inbox': {}, 'reports': {}}
         for group_id in sorted(set(group_ids or [])):
             row = conn.execute(
                 'SELECT default_preferences FROM groups WHERE id=?', (group_id,)
