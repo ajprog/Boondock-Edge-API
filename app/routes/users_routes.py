@@ -19,7 +19,7 @@ def _valid_groups(group_ids):
 
 
 def _valid_preferences(preferences, admin):
-    if not isinstance(preferences, dict) or set(preferences) != {'display', 'inbox', 'reports'}:
+    if not isinstance(preferences, dict) or set(preferences) != {'inbox', 'reports'}:
         return False
     if not all(isinstance(preferences[name], dict) for name in preferences):
         return False
