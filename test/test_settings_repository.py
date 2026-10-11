@@ -87,8 +87,10 @@ def test_new_user_preferences_are_resolved_from_group_defaults(
         "name": "First",
         "permissions": [],
         "default_preferences": {
-            "display": {"time_format": "12h"},
-            "inbox": {"records_per_page": 20},
+            "inbox": {
+                "time_format": "12h",
+                "records_per_page": 20,
+            },
             "reports": {},
         },
     })
@@ -96,8 +98,10 @@ def test_new_user_preferences_are_resolved_from_group_defaults(
         "name": "Second",
         "permissions": [],
         "default_preferences": {
-            "display": {"time_format": "24h"},
-            "inbox": {"show_channel": True},
+            "inbox": {
+                "time_format": "24h",
+                "show_channel": True,
+            },
             "reports": {"density": "compact"},
         },
     })
@@ -113,8 +117,11 @@ def test_new_user_preferences_are_resolved_from_group_defaults(
     )
 
     assert manager.get_user("defaults@example.com")["preferences"] == {
-        "display": {"time_format": "24h"},
-        "inbox": {"records_per_page": 20, "show_channel": True},
+        "inbox": {
+            "time_format": "24h",
+            "records_per_page": 20,
+            "show_channel": True,
+        },
         "reports": {"density": "compact"},
     }
 

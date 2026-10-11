@@ -1,5 +1,7 @@
 """User administration, preferences, and MFA management."""
 
+import json
+
 from flask import Blueprint, g, jsonify, request
 
 from ..middleware.auth_middleware import require_admin, require_auth
@@ -27,17 +29,51 @@ def _valid_preferences(preferences, admin):
     return admin or not admin_fields.intersection(preferences['inbox'])
 
 
+def _group_ids(value):
+    if isinstance(value, list):
+        return [group_id for group_id in value if isinstance(group_id, int)]
+    if not value:
+        return []
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [group_id for group_id in decoded if isinstance(group_id, int)]
+
+
+def _public_user(user):
+    """Return the admin user-management representation."""
+    principal = _settings_manager.get_principal('user', user['id']) or {}
+    return {
+        'id': user['id'],
+        'email': user.get('email'),
+        'name': user.get('name'),
+        'role': user.get('role'),
+        'groups': _group_ids(user.get('groups')),
+        'permissions': principal.get('permissions', []),
+        'keywords': principal.get('keywords', []),
+        'preferences': principal.get('preferences', {'inbox': {}, 'reports': {}}),
+        'mfa_enabled': bool(user.get('mfa_enabled')),
+        'mfa_enforced': bool(user.get('mfa_enforced')),
+    }
+
+
 @users_bp.route('/users', methods=['GET'])
 @require_admin
 def get_users():
-    return jsonify(list(_settings_manager.get_all_users(safe=True).values()))
+    users = _settings_manager.get_all_users()
+    return jsonify([_public_user(user) for user in users.values()])
 
 
 @users_bp.route('/users/<int:user_id>', methods=['GET'])
 @require_admin
 def get_user(user_id):
-    user = _settings_manager.get_user_by_id(user_id, safe=True)
-    return (jsonify(user), 200) if user else (jsonify({'error': 'User not found'}), 404)
+    user = _settings_manager.get_user_by_id(user_id)
+    return (jsonify(_public_user(user)), 200) if user else (
+        jsonify({'error': 'User not found'}), 404
+    )
 
 
 @users_bp.route('/users', methods=['POST'])
@@ -62,7 +98,8 @@ def create_user():
         user['preferences'] = data['preferences']
     if not _settings_manager.save_user(email, user):
         return jsonify({'error': 'Unable to create user'}), 500
-    return jsonify(_settings_manager.get_user(email, safe=True)), 201
+    saved = _settings_manager.get_user(email)
+    return jsonify(_public_user(saved)), 201
 
 
 @users_bp.route('/users/<int:user_id>', methods=['PATCH'])
@@ -103,7 +140,7 @@ def update_user(user_id):
         if 'unique' in str(exc).lower():
             return jsonify({'error': 'Email already exists'}), 409
         raise
-    return jsonify(_settings_manager.get_user_by_id(user_id, safe=True))
+    return jsonify(_public_user(_settings_manager.get_user_by_id(user_id)))
 
 
 @users_bp.route('/users/<int:user_id>', methods=['DELETE'])
@@ -117,7 +154,10 @@ def delete_user(user_id):
 @users_bp.route('/users/<int:user_id>/mfa/reset', methods=['POST'])
 @require_admin
 def reset_mfa(user_id):
-    if not _settings_manager.update_user_by_id(user_id, {'mfa_enabled': False, 'mfa_secret': None}):
+    if not _settings_manager.update_user_by_id(
+        user_id,
+        {'mfa_enabled': False, 'mfa_secret': None},
+    ):
         return jsonify({'error': 'User not found'}), 404
     return jsonify({'message': 'MFA reset'})
 

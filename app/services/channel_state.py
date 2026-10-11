@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from flask import request
 
 from .settings_manager import get_settings_manager, normalize_mac_address
+from .notification_service import get_active_notifications
 from ..utils.sqlite_utils import connect_sqlite
 
 _settings_manager = get_settings_manager()
@@ -382,6 +383,7 @@ def load_inbox(principal, value=None, id_argument=None):
         last = messages[-1] if messages else None
         return ({
             'messages': messages,
+            'notifications': get_active_notifications(),
             'meta': {
                 'total': total,
                 'has_more': has_more,
