@@ -111,7 +111,6 @@ def _upgrade_groups(db):
                 keyword_ids.append(cursor.lastrowid)
             db.execute("UPDATE groups SET keywords=? WHERE id=?", (json.dumps(keyword_ids), row[0]))
 
-
 def _upgrade_users(db):
     if "users" not in _tables(db):
         return
@@ -152,7 +151,6 @@ def _upgrade_users(db):
     db.execute("DROP TABLE users_dashboard_legacy")
     db.execute("DROP TABLE IF EXISTS pagination_preferences")
 
-
 def _upgrade_recorders_inventory(db):
     """Convert legacy TEXT recorder inventory data to the current JSON column."""
     if "recorders_inventory" not in _tables(db):
@@ -183,7 +181,6 @@ def _upgrade_recorders_inventory(db):
         )
 
     db.execute("DROP TABLE recorders_inventory_dashboard_legacy")
-
 
 def _upgrade_hallucinations(db):
     if "hallucinations" not in _tables(db):
