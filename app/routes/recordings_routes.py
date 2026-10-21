@@ -586,7 +586,7 @@ def serve_audio(filename, recording):
     full_path = DATA_ROOT / recording['filename']
 
     if not full_path.is_file():
-        return jsonify({'error': 'Audio file not found'}), 405
+        return jsonify({'error': 'Audio file not found'}), 404
 
     return send_from_directory(full_path.parent, full_path.name)
 
@@ -620,17 +620,16 @@ def delete_recording(recording_id, recording):
     try:
         full_path = DATA_ROOT / recording['filename']
 
-        if not full_path.is_file():
-            return jsonify({'error': 'Audio file not found'}), 404
-        else:
-            # Commit the database deletion before touching the filesystem. This avoids
-            # leaving a live database row pointing at a file that was already removed
-            # if the database operation fails.
-            conn = sqlite3.connect(DB_PATH)
-            conn.execute("DELETE FROM recordings WHERE id = ?", (recording_id,))
-            conn.commit()
+        # Commit the database deletion before touching the filesystem. This avoids
+        # leaving a live database row pointing at a file that was already removed
+        # if the database operation fails.
+        # Remove the database entry even if the audio file is already missing.
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("DELETE FROM recordings WHERE id = ?", (recording_id,))
+        conn.commit()
 
-            file_deleted = False
+        file_deleted = False
+        if full_path.is_file():
             try:
                 full_path.unlink()
                 file_deleted = True

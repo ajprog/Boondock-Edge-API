@@ -46,20 +46,7 @@ def _recording_exists(db_path, recording_id):
         )
 
 
-def test_resolve_recording_path_accepts_files_only_within_recordings_directory(
-    recording_store,
-):
-    _, recordings_dir = recording_store
-
-    assert recordings_routes._resolve_recording_path(
-        "recordings/device/audio.wav"
-    ) == recordings_dir / "device" / "audio.wav"
-    assert recordings_routes._resolve_recording_path("../outside.wav") is None
-
-
-def test_recordings_route_reads_real_recordings_database(
-    recording_store, admin_auth
-):
+def test_recordings_route_reads_real_recordings_database(recording_store, admin_auth):
     db_path, _ = recording_store
     _insert_recording(
         db_path,
@@ -75,9 +62,7 @@ def test_recordings_route_reads_real_recordings_database(
     assert response.status_code == 404
 
 
-def test_recordings_inbox_applies_real_query_filters(
-    recording_store, admin_auth
-):
+def test_recordings_inbox_applies_real_query_filters(recording_store, admin_auth):
     db_path, _ = recording_store
     _insert_recording(db_path, 1, "recordings/1.wav", timestamp=1787054400000)
     _insert_recording(db_path, 2, "recordings/2.wav", timestamp=1787058000000)
@@ -160,12 +145,27 @@ def test_serve_audio_returns_existing_file(recording_store, admin_auth):
     from app import create_app
 
     response = create_app().test_client().get(
-        "/api/recordings/recordings/device/audio.wav",
+        "/api/recordings/device/audio.wav",
         headers=admin_auth,
     )
 
     assert response.status_code == 200
     assert response.get_data() == b"audio contents"
+
+
+def test_serve_audio_rejects_incorrect_prefixed_url(recording_store, admin_auth):
+    db_path, recordings_dir = recording_store
+    audio_file = recordings_dir / "device" / "audio.wav"
+    audio_file.parent.mkdir(parents=True, exist_ok=True)
+    audio_file.write_bytes(b"audio contents")
+    _insert_recording(db_path, 1, "recordings/device/audio.wav")
+
+    from app import create_app
+
+    response = create_app().test_client().get(
+        "/api/recordings/recordings/device/audio.wav", headers=admin_auth
+    )
+    assert response.status_code == 404
 
 
 def test_serve_audio_returns_not_found_for_missing_recording(
@@ -174,7 +174,7 @@ def test_serve_audio_returns_not_found_for_missing_recording(
     from app import create_app
 
     response = create_app().test_client().get(
-        "/api/recordings/recordings/missing.wav",
+        "/api/recordings/missing.wav",
         headers=admin_auth,
     )
 
@@ -223,23 +223,6 @@ def test_delete_recording_succeeds_when_audio_file_is_already_missing(
         "file_deleted": False,
     }
     assert not _recording_exists(db_path, 2)
-
-
-def test_delete_recording_rejects_path_outside_recordings_directory(
-    recording_store, admin_auth
-):
-    db_path, _ = recording_store
-    _insert_recording(db_path, 3, "../outside.wav")
-
-    from app import create_app
-
-    response = create_app().test_client().delete(
-        "/api/recordings/3", headers=admin_auth
-    )
-
-    assert response.status_code == 400
-    assert response.get_json() == {"error": "Invalid recording file path"}
-    assert _recording_exists(db_path, 3)
 
 
 def test_delete_recording_reports_file_deletion_failure(

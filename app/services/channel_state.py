@@ -9,8 +9,6 @@ from typing import Dict, Optional
 from datetime import datetime, timedelta, timezone
 from flask import request
 
-import logging
-
 from .settings_manager import get_settings_manager, normalize_mac_address
 from .notification_service import get_active_notifications
 from ..utils.sqlite_utils import connect_sqlite
@@ -240,10 +238,6 @@ def load_request_recording(principal, value, id_argument):
     """Load one recording within the principal's channel scope."""
     joins, clauses, parameters = _recording_join_scope(principal)
 
-    logging.warning(
-        "Recording lookup: id_argument=%r, value=%r, owner_ids=%r",
-        id_argument, value, principal.get('owner_ids')
-    )
     if id_argument == 'recording_id':
         clauses.append("recordings.id = ?")
     elif id_argument == 'filename':
@@ -252,10 +246,6 @@ def load_request_recording(principal, value, id_argument):
             clauses.append("recordings.filename = ?")
             value = path.relative_to(DATA_ROOT).as_posix()
 
-            logging.warning(
-                "Recording path: RECORDINGS_DIR=%s, value=%s, resolved=%s",
-                RECORDINGS_DIR, value, path
-            )
         else:
                 raise ValueError(f"Unsupported filename: {value}")
     else:
