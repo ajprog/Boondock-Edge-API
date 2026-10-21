@@ -8,6 +8,12 @@ from urllib.parse import urlsplit
 from .recorder_monitor import get_port_mac_map, send_command_and_wait_response
 from .settings_manager import get_settings_manager, normalize_mac_address
 
+
+import logging
+
+_logger = logging.getLogger(__name__)
+
+
 _settings_manager = get_settings_manager()
 
 _EXPORT_TO_CHANNEL = {
@@ -137,7 +143,10 @@ def export_channel_configuration(channel, recorder):
         log_command='IMPORT [configuration omitted]',
     )
     if not success:
-        raise TimeoutError('Recorder did not confirm configuration import')
-
+        raise TimeoutError(
+            f"Recorder did not confirm configuration import: "
+            f"JSON length={len(payload.encode('utf-8'))}, "
+            f"command length={len(f'IMPORT {payload}' + chr(13) + chr(10))}"
+        )
     with _config_lock:
         _exported_configs[port] = config

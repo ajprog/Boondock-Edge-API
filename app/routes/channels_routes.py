@@ -100,13 +100,6 @@ def get_channel(channel_id, channel):
     """Get details for a specific channel."""
     recorder = find_connected_recorder(channel.get('mac'))
     device_sync = {'attempted': recorder is not None, 'success': None, 'error': None}
-    if recorder is not None:
-        try:
-            channel = import_recorder_configuration(channel, recorder)
-            device_sync['success'] = True
-        except Exception as exc:
-            logging.exception('Unable to synchronize recorder for channel %s', channel_id)
-            device_sync.update(success=False, error=str(exc))
     response = present_channel(channel, recorder)
     response['device_sync'] = device_sync
     return jsonify(response)
@@ -191,7 +184,9 @@ def update_channel(channel_id, channel):
         ('silence', data.get('silence'), lambda x: 500 <= float(x) <= 5000, "Silence must be between 500 and 5000 milliseconds."),
         ('min_rec', data.get('min_rec'), lambda x: 1000 <= float(x) <= 5000, "Min recording time must be between 1000 and 5000 milliseconds."),
         ('max_rec', data.get('max_rec'), lambda x: 10000 <= float(x) <= 30000, "Max recording time must be between 10000 and 30000 milliseconds."),
-        ('audio_gain', data.get('audio_gain'), lambda x: 1 <= float(x) <= 10, "Audio gain must be between 1 and 10.")
+        ('audio_gain', data.get('audio_gain'),
+            lambda x: float(x) in (-3, 0, 3, 6, 9, 12, 15, 18, 21, 24),
+            "Audio gain must be one of: -3, 0, 3, 6, 9, 12, 15, 18, 21, 24 dB.")
     ]
 
     for field, value, validation_func, error_msg in audio_validations:

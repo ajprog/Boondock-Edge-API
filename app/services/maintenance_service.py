@@ -286,7 +286,8 @@ class MaintenanceService:
                 table_name = row[0]
                 try:
                     # Get row count
-                    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+                    quoted_table = '"' + table_name.replace('"', '""') + '"'
+                    cursor.execute(f"SELECT COUNT(*) FROM {quoted_table}")
                     row_count = cursor.fetchone()[0]
                     
                     # Get table size using SQLite's internal statistics

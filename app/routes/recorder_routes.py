@@ -1519,69 +1519,6 @@ def send_monitor_command():
     })
 
 
-@recorders_bp.route('/monitor/send-by-mac', methods=['POST'])
-@require_admin
-def send_monitor_command_by_mac():
-    """Resolve a device MAC to its serial port and send one or more commands to it.
-
-    Used by the channel settings modal so that saving audio settings pushes the
-    matching CLI SET/SAVE commands to the specific recorder over the serial monitor.
-    Body: { "mac": "AABBCC...", "commands": ["SET audio.codecgain 3", "SAVE"] }
-    (a single "command" string is also accepted).
-    """
-    payload = request.get_json(silent=True) or {}
-    mac = (payload.get('mac') or '').strip()
-    commands = payload.get('commands')
-    single = payload.get('command')
-    if single and not commands:
-        commands = [single]
-
-    if not mac:
-        return jsonify({'message': 'mac is required.'}), 400
-
-    if not commands or not isinstance(commands, list):
-        return jsonify({'message': 'commands list is required.'}), 400
-
-    if not _settings_allow_discovery():
-        return jsonify({'message': 'Recorder discovery is disabled.'}), 403
-
-    def _norm_mac(value):
-        return re.sub(r'[^0-9A-Fa-f]', '', value or '').upper()
-
-    target_mac = _norm_mac(mac)
-    port = None
-    for com_port, dev_mac in get_port_mac_map().items():
-        if _norm_mac(dev_mac) == target_mac:
-            port = com_port
-            break
-
-    if not port:
-        return jsonify({
-            'message': f'No connected/monitored recorder found for MAC {mac}.',
-            'mac': mac
-        }), 404
-
-    results = []
-    for raw_cmd in commands:
-        cmd = (raw_cmd or '').strip()
-        if not cmd:
-            continue
-        ok = bool(send_command_to_ports([port], cmd).get(port, False))
-        results.append({'command': cmd, 'success': ok})
-        # Small gap so the firmware can process each SET before the trailing SAVE.
-        time.sleep(0.15)
-
-    success_count = sum(1 for r in results if r['success'])
-    return jsonify({
-        'message': f'Sent {success_count}/{len(results)} command(s) to {port}.',
-        'mac': mac,
-        'port': port,
-        'results': results,
-        'success_count': success_count,
-        'total_count': len(results)
-    })
-
-
 @recorders_bp.route('/monitor/autoconfig', methods=['POST'])
 @require_admin
 def send_autoconfig():

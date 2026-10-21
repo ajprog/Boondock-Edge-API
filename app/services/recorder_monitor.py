@@ -610,7 +610,7 @@ def _add_message(port, message):
     if _line_indicates_command_ok(message, json_data):
         ack = json_data if isinstance(json_data, dict) else {'status': 'ok', 'raw': message}
         with _monitoring_lock:
-            waiter = _response_waiters.pop(port, None)
+            waiter = _response_waiters.get(port)
             if waiter is not None:
                 waiter['result'] = ack
                 waiter['event'].set()
@@ -618,7 +618,14 @@ def _add_message(port, message):
         _process_parsed_message(port, json_data, timestamp)
 
         export_mac = _pending_config_exports.get(port)
-        if export_mac and not json_data.get('ty'):
+        config = json_data.get('data') if isinstance(json_data, dict) else None
+
+        if (
+            export_mac
+            and isinstance(config, dict)
+            and isinstance(config.get('a'), dict)
+            and config.get('mac', '').upper() == export_mac.upper()
+        ):
             try:
                 from .channel_recorder_sync import import_recorder_configuration
 
@@ -627,7 +634,7 @@ def _add_message(port, message):
                     import_recorder_configuration(
                         channel,
                         {'port': port},
-                        json_data,
+                        config,
                     )
                     _pending_config_exports.pop(port, None)
                     _synchronized_config_mac[port] = export_mac
@@ -1361,8 +1368,10 @@ def send_command_and_wait_response(port, command, timeout=5.0, log_command=None)
                     _response_waiters.pop(port, None)
                     return False, None
                 try:
-                    conn.write(command_bytes)
-                    conn.flush()
+                    for offset in range(0, len(command_bytes), 32):
+                        conn.write(command_bytes[offset:offset + 32])
+                        conn.flush()
+                        time.sleep(0.02)
                 except (SerialException, Exception) as exc:
                     _logger.error("Failed to send command to %s: %s", port, exc)
                     _response_waiters.pop(port, None)
