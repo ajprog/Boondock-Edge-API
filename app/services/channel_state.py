@@ -4,14 +4,17 @@ Tracks recording/idle/error/warning states for visual feedback without persistin
 """
 import threading
 import time
-from config import Config
+from config import Config, DATA_ROOT
 from typing import Dict, Optional
 from datetime import datetime, timedelta, timezone
 from flask import request
 
+import logging
+
 from .settings_manager import get_settings_manager, normalize_mac_address
 from .notification_service import get_active_notifications
 from ..utils.sqlite_utils import connect_sqlite
+from ..routes.route_utils import RECORDINGS_DIR
 
 _settings_manager = get_settings_manager()
 
@@ -107,20 +110,38 @@ def load_owned_channels(principal):
     """Load the channels accessible to the principal."""
     return _settings_manager.get_all_channels(owner_ids=principal.get('owner_ids'))
 
-def load_request_channel(principal, value, id_argument):
+def load_request_channel(principal, value=None, id_argument=None):
     """Load the device channel or an owned channel."""
     if principal.get('type') == 'device':
         return _settings_manager.get_channel(principal.get('id'))
-    elif id_argument == 'channel_id':
+
+    if id_argument is None:
+        if request.values.get('channel_id'):
+            id_argument = 'channel_id'
+            value = request.values.get('channel_id')
+        elif request.values.get('mac'):
+            id_argument = 'mac'
+            value = request.values.get('mac')
+        elif request.values.get('mac_address'):
+            id_argument = 'mac'
+            value = request.values.get('mac_address')
+
+    if id_argument == 'channel_id':
         owner_ids = principal.get('owner_ids')
         if owner_ids is None:
-            return _settings_manager.get_channel(value)
+            try:
+                channel_id = int(value)
+            except (TypeError, ValueError):
+                return None
+            return _settings_manager.get_channel(channel_id)
+
         try:
             channel_id = int(value)
         except (TypeError, ValueError):
             return None
         return _settings_manager.get_channel(channel_id, owner_ids=owner_ids)
-    elif id_argument == 'mac':
+
+    if id_argument == 'mac':
         mac_address = normalize_mac_address(value) if value else None
         if not mac_address or len(mac_address) != 12:
             return None
@@ -219,10 +240,24 @@ def load_request_recording(principal, value, id_argument):
     """Load one recording within the principal's channel scope."""
     joins, clauses, parameters = _recording_join_scope(principal)
 
+    logging.warning(
+        "Recording lookup: id_argument=%r, value=%r, owner_ids=%r",
+        id_argument, value, principal.get('owner_ids')
+    )
     if id_argument == 'recording_id':
         clauses.append("recordings.id = ?")
     elif id_argument == 'filename':
-        clauses.append("recordings.filename = ?")
+        path = (RECORDINGS_DIR / value).resolve()
+        if path.is_relative_to(RECORDINGS_DIR):
+            clauses.append("recordings.filename = ?")
+            value = path.relative_to(DATA_ROOT).as_posix()
+
+            logging.warning(
+                "Recording path: RECORDINGS_DIR=%s, value=%s, resolved=%s",
+                RECORDINGS_DIR, value, path
+            )
+        else:
+                raise ValueError(f"Unsupported filename: {value}")
     else:
         raise ValueError(f"Unsupported recording identifier: {id_argument}")
     parameters.append(value)

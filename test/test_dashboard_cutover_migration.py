@@ -24,6 +24,12 @@ def test_upgrade_dashboard_schema_migrates_preferences_identity_and_recordings(t
         CREATE TABLE channels (id INTEGER PRIMARY KEY, mac TEXT);
         CREATE TABLE hallucinations (id INTEGER PRIMARY KEY, data TEXT);
         INSERT INTO hallucinations VALUES (3, '{"pattern":"*engine fire*"}');
+        CREATE TABLE recorders_inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            data TEXT
+        );
+        INSERT INTO recorders_inventory(data)
+            VALUES ('{"port":"/dev/ttyUSB0","monitor":true}');
     """)
     settings = {
         "global_inbox_view_mode": "pagination", "global_inbox_records_per_page": 20,
@@ -72,6 +78,16 @@ def test_upgrade_dashboard_schema_migrates_preferences_identity_and_recordings(t
     ).fetchone() is None
     pattern = db.execute("SELECT pattern,match_type FROM hallucinations WHERE id=3").fetchone()
     assert pattern[1] == "regex"
+
+    recorder_info = list(db.execute("PRAGMA table_info(recorders_inventory)"))
+    recorder_data_type = next(r[2] for r in recorder_info if r[1] == "data")
+    recorder = db.execute("SELECT id,data FROM recorders_inventory").fetchone()
+    assert recorder_data_type == "JSON"
+    assert recorder["id"] == 1
+    assert json.loads(recorder["data"]) == {
+        "port": "/dev/ttyUSB0",
+        "monitor": True,
+    }
     db.close()
 
     recordings = sqlite3.connect(recordings_path)
@@ -96,6 +112,8 @@ def test_clean_install_schema_contains_only_current_cutover_columns(monkeypatch,
     users = {r[1] for r in settings.execute("PRAGMA table_info(users)")}
     groups = {r[1] for r in settings.execute("PRAGMA table_info(groups)")}
     hallucinations = {r[1] for r in settings.execute("PRAGMA table_info(hallucinations)")}
+    recorder_info = list(settings.execute("PRAGMA table_info(recorders_inventory)"))
+    recorder_data_type = next(r[2] for r in recorder_info if r[1] == "data")
     tables = {r[0] for r in settings.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     settings.close()
     assert users == {
@@ -105,6 +123,7 @@ def test_clean_install_schema_contains_only_current_cutover_columns(monkeypatch,
     }
     assert {"default_preferences", "keywords"} <= groups
     assert hallucinations == {"id", "pattern", "match_type", "case_sensitive"}
+    assert recorder_data_type == "JSON"
     assert "pagination_preferences" not in tables
 
     recordings = sqlite3.connect(recordings_path)

@@ -6,10 +6,10 @@ Works on both Windows and Ubuntu/Linux
 To enable auto-reload on code changes (development mode):
   Windows: set PRODUCTION_MODE=false && python run.py
   Linux:   PRODUCTION_MODE=false python run.py
-  
+
 Or set environment variable before running:
   export PRODUCTION_MODE=false  # Linux/Mac
-  set PRODUCTION_MODE=false      # Windows
+  set PRODUCTION_MODE=false     # Windows
 """
 import json
 import atexit
@@ -151,15 +151,15 @@ def main():
     logger.info("Starting Boondock Edge Server")
     logger.info("Working directory: %s", CODE_ROOT)
     logger.info("=" * 60)
-    
+
     # Load settings (from database)
     settings = load_settings()
-    
+
     # Create Flask app
     try:
         logger.info("Creating Flask application...")
         app = create_app(Config)
-        
+
         # Enable CORS — origins sourced from the environment so each deployment
         # can lock down to its own domain.  The wildcard fallback is acceptable
         # for LAN-only edge devices but should be overridden in production.
@@ -194,16 +194,18 @@ def main():
             logger.warning("Could not probe gevent safely; using threading mode: %s", exc)
 
         socketio = SocketIO(app, cors_allowed_origins=cors_origins, async_mode=async_mode)
-        
+
         logger.info("Flask application created successfully")
     except Exception as e:
         logger.error(f"Failed to create Flask application: {e}")
         sys.exit(1)
-    
-    # Initialize scanners and recorders in background
-    enable_scanners = settings.get('global_enable_uniden_scanners', True)
-    enable_recorders = settings.get('global_enable_edge_devices', False)
-    
+
+    # Initialize scanners and recorders in background.
+    # These names match the current settings schema created by db_initializer
+    # and by the dashboard cutover migration.
+    enable_scanners = settings.get('uniden_scanners_enabled', False)
+    enable_recorders = settings.get('edge_recorders_enabled', True)
+
     if enable_scanners:
         def init_scanners():
             try:
@@ -212,9 +214,9 @@ def main():
                 logger.info(f"Scanner inventory initialized: {summary}")
             except Exception as e:
                 logger.warning(f"Scanner initialization failed: {e}")
-        
+
         threading.Thread(target=init_scanners, daemon=True).start()
-    
+
     if enable_recorders:
         def init_recorders():
             try:
@@ -223,9 +225,9 @@ def main():
                 logger.info(f"Recorder inventory initialized: {summary}")
             except Exception as e:
                 logger.warning(f"Recorder initialization failed: {e}")
-        
+
         threading.Thread(target=init_recorders, daemon=True).start()
-    
+
     # Initialize other optional services
     try:
         from app.services.s3_scheduler import start_scheduler
@@ -233,7 +235,7 @@ def main():
         logger.info("S3 backup scheduler started")
     except Exception as e:
         logger.debug(f"S3 scheduler failed: {e}")
-    
+
     # Start maintenance scheduler
     try:
         from app.services.maintenance_scheduler import start_scheduler as start_maintenance_scheduler
@@ -241,18 +243,18 @@ def main():
         logger.info("Maintenance scheduler started")
     except Exception as e:
         logger.debug(f"Maintenance scheduler failed: {e}")
-    
+
     # Start server
     host = Config.FLASK_HOST
     port = Config.FLASK_PORT
     production_mode = Config.PRODUCTION_MODE
     server_type = Config.PRODUCTION_SERVER if production_mode else 'dev'
-    
+
     logger.info("=" * 60)
     logger.info(f"Starting server: {server_type} mode")
     logger.info(f"Host: {host}, Port: {port}")
     logger.info("=" * 60)
-    
+
     try:
         if production_mode and server_type == 'waitress':
             logger.warning(

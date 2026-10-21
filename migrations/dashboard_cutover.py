@@ -153,6 +153,38 @@ def _upgrade_users(db):
     db.execute("DROP TABLE IF EXISTS pagination_preferences")
 
 
+def _upgrade_recorders_inventory(db):
+    """Convert legacy TEXT recorder inventory data to the current JSON column."""
+    if "recorders_inventory" not in _tables(db):
+        return
+
+    data_type = next(
+        (row[2].upper() for row in db.execute('PRAGMA table_info("recorders_inventory")')
+         if row[1] == "data"),
+        "",
+    )
+    if data_type == "JSON":
+        return
+
+    rows = db.execute("SELECT id,data FROM recorders_inventory ORDER BY id").fetchall()
+    db.execute("ALTER TABLE recorders_inventory RENAME TO recorders_inventory_dashboard_legacy")
+    db.execute("""CREATE TABLE recorders_inventory (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data JSON
+    )""")
+
+    for row in rows:
+        value = row["data"]
+        if isinstance(value, str):
+            value = _decode(value, value)
+        db.execute(
+            "INSERT INTO recorders_inventory(id,data) VALUES(?,?)",
+            (row["id"], json.dumps(value)),
+        )
+
+    db.execute("DROP TABLE recorders_inventory_dashboard_legacy")
+
+
 def _upgrade_hallucinations(db):
     if "hallucinations" not in _tables(db):
         return
@@ -308,6 +340,7 @@ def upgrade_dashboard_schema(settings_path, recordings_path):
         db.execute("BEGIN IMMEDIATE")
         _upgrade_groups(db)
         _upgrade_users(db)
+        _upgrade_recorders_inventory(db)
         if "channels" in _tables(db):
             if "device_hostname" not in _columns(db, "channels"):
                 db.execute("ALTER TABLE channels ADD COLUMN device_hostname TEXT")

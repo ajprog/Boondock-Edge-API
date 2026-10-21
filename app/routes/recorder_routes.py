@@ -1420,24 +1420,6 @@ def get_recorder_logs():
             msg = line
         return ts_str, msg
 
-        if base_dir.is_dir():
-            for file_path in base_dir.glob(f"{date_str}_*.log"):
-                port_name = file_path.stem.split("_", 1)[1]
-
-                if port_filter and port_name != port_filter:
-                    continue
-
-                try:
-                    with file_path.open("r", encoding="utf-8") as f:
-                        for line in f:
-                            if parsed := _parse_line(line):
-                                _add_line(port_name, parsed[0], parsed[1])
-                except Exception as exc:
-                    _logger.error(
-                        "Failed to read recorder log file %s: %s",
-                        file_path,
-                        exc,
-                    )
     try:
         dbm = get_db_logging_manager()
         for row in dbm.get_logs('com_port', date=date_str, limit=25000):

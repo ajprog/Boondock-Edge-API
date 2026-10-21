@@ -37,12 +37,6 @@ _settings_manager = get_settings_manager()
 
 recordings_bp = Blueprint('recordings', __name__)
 
-
-def _resolve_recording_path(filename):
-    """Resolve a stored recording path without allowing it to escape recordings/."""
-    path = (DATA_ROOT / filename).resolve()
-    return path if path.is_relative_to(RECORDINGS_DIR) else None
-
 @recordings_bp.route('/uploads/queue', methods=['POST'])
 @require_admin
 @swag_from({
@@ -589,11 +583,12 @@ def get_recordings_inbox(result):
     }
 })
 def serve_audio(filename, recording):
-    file_path = _resolve_recording_path(recording.get('filename'))
-    if file_path is None or not file_path.is_file():
-        return abort(404, description="Audio file not found")
+    full_path = DATA_ROOT / recording['filename']
 
-    return send_from_directory(file_path.parent, file_path.name)
+    if not full_path.is_file():
+        return jsonify({'error': 'Audio file not found'}), 405
+
+    return send_from_directory(full_path.parent, full_path.name)
 
 
 @recordings_bp.route('/recordings/<int:recording_id>', methods=['DELETE'])
@@ -623,29 +618,27 @@ def delete_recording(recording_id, recording):
     """Delete a specific recording by ID."""
     conn = None
     try:
-        filename = recording.get('filename')
-        file_path = _resolve_recording_path(filename) if filename else None
+        full_path = DATA_ROOT / recording['filename']
 
-        if filename and file_path is None:
-            return jsonify({"error": "Invalid recording file path"}), 400
+        if not full_path.is_file():
+            return jsonify({'error': 'Audio file not found'}), 404
+        else:
+            # Commit the database deletion before touching the filesystem. This avoids
+            # leaving a live database row pointing at a file that was already removed
+            # if the database operation fails.
+            conn = sqlite3.connect(DB_PATH)
+            conn.execute("DELETE FROM recordings WHERE id = ?", (recording_id,))
+            conn.commit()
 
-        # Commit the database deletion before touching the filesystem. This avoids
-        # leaving a live database row pointing at a file that was already removed
-        # if the database operation fails.
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("DELETE FROM recordings WHERE id = ?", (recording_id,))
-        conn.commit()
-
-        file_deleted = False
-        if file_path and file_path.is_file():
+            file_deleted = False
             try:
-                file_path.unlink()
+                full_path.unlink()
                 file_deleted = True
             except OSError as e:
                 logging.error(
                     "Deleted recording %s from the database but failed to delete %s: %s",
                     recording_id,
-                    file_path,
+                    full_path,
                     e,
                 )
                 return jsonify({
@@ -693,12 +686,11 @@ def get_audio_url(recording_id, recording):
     Responds with the audio file as an attachment if found.
     """
     try:
-        filename = recording.get('filename')
-        full_path = _resolve_recording_path(filename)
+        full_path = DATA_ROOT / recording['filename']
 
-        if full_path is None or not full_path.is_file():
+        if not full_path.is_file():
             return jsonify({'error': 'Audio file not found'}), 404
-
+        
         channel_name = recording.get('channel_name') or 'Audio'
 
         # Return both the file (as attachment) and the OS full path in JSON
@@ -746,10 +738,9 @@ def get_audio_url_file(recording_id, recording):
     The downloaded filename uses the recording's UTC timestamp.
     """
     try:
-        filename = recording.get('filename')
-        full_path = _resolve_recording_path(filename)
+        full_path = DATA_ROOT / recording['filename']
 
-        if full_path is None or not full_path.is_file():
+        if not full_path.is_file():
             return jsonify({'error': 'Audio file not found'}), 404
 
         channel_name = recording.get('channel_name') or 'Audio'
@@ -861,9 +852,9 @@ def get_recording_duration(recording_id, recording):
                     error_logger.error(f"Failed to store duration in database: {e}")
             else:
                 # Fallback: Calculate from audio file if filesize not available
-                full_path = os.path.abspath(os.path.normpath((DATA_ROOT / filename).resolve()))
+                full_path = (DATA_ROOT / filename).resolve()
 
-                if not os.path.exists(full_path):
+                if not full_path.is_file():
                     return jsonify({'error': 'Audio file not found'}), 404
 
                 try:
@@ -971,10 +962,11 @@ def truncate_recordings():
                 try:
                     if filename:
                         # filename is relative path like 'recordings/MAC/YYYY/MM/DD/file.wav'
-                        file_path = _resolve_recording_path(filename)
-                        if file_path is None:
+                        file_path = DATA_ROOT / filename
+
+                        if not file_path.is_file():
                             errors.append(f"Refused to delete invalid recording path: {filename}")
-                        elif file_path.exists():
+                        else:
                             file_path.unlink()
                             deleted_count += 1
                 except Exception as e:
