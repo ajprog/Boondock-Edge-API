@@ -4,25 +4,16 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+
 @pytest.fixture
 def channel_api(initialized_settings_manager):
     manager = initialized_settings_manager
     manager.save_group(
-        {
-            "name": "Default",
-            "description": "Default user group",
-            "is_default": True,
-            "permissions": [],
-        }
+        {"name": "Default", "description": "Default user group", "is_default": True, "permissions": []}
     )
     manager.save_user(
         "admin@example.com",
-        {
-            "name": "Admin",
-            "password": "unused",
-            "role": "admin",
-            "groups": [],
-        },
+        {"name": "Admin", "password": "unused", "role": "admin", "groups": []},
     )
     token, _ = manager.issue_credential(
         "user",
@@ -64,20 +55,21 @@ def test_channel_update_rejects_threshold_outside_documented_range(channel_api):
     assert manager.get_channel(channel_id)["threshold"] is None
 
 
-def test_channel_read_synchronizes_connected_recorder(channel_api, monkeypatch):
+def test_channel_read_returns_saved_settings_without_resynchronizing(channel_api, monkeypatch):
     client, manager, channel_id, headers = channel_api
     from app.routes import channels_routes
 
     recorder = {"port": "/dev/ttyUSB0"}
     monkeypatch.setattr(channels_routes, "find_connected_recorder", lambda _mac: recorder)
 
-    def import_config(channel, connected):
-        assert connected is recorder
-        channel.update(device_hostname="edge-1.local", device_ip="192.168.4.12")
-        manager.save_channel(channel)
-        return channel
+    channel = manager.get_channel(channel_id)
+    channel.update(device_hostname="edge-1.local", device_ip="192.168.4.12")
+    manager.save_channel(channel)
 
-    monkeypatch.setattr(channels_routes, "import_recorder_configuration", import_config)
+    def unexpected_import(*_args, **_kwargs):
+        raise AssertionError("GET must not synchronize the recorder")
+
+    monkeypatch.setattr(channels_routes, "import_recorder_configuration", unexpected_import)
 
     response = client.get(f"/api/channels/{channel_id}", headers=headers)
 
@@ -85,7 +77,6 @@ def test_channel_read_synchronizes_connected_recorder(channel_api, monkeypatch):
     body = response.get_json()
     assert body["usb_connected"] is True
     assert body["device_dashboard_url"] == "http://edge-1.local/"
-    assert body["device_sync"] == {"attempted": True, "success": True, "error": None}
     assert manager.get_channel(channel_id)["device_ip"] == "192.168.4.12"
 
 

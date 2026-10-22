@@ -13,13 +13,7 @@ def test_import_maps_echo_tango_export_fields(monkeypatch):
         channel,
         {"port": "/dev/ttyUSB0"},
         {
-            "a": {
-                "ath": 42,
-                "stm": 1600,
-                "mrm": 1200,
-                "xrm": 25000,
-                "cg": 4,
-            },
+            "a": {"ath": 42, "stm": 1600, "mrm": 1200, "xrm": 25000, "cg": 4},
             "ho": "edge-7.local",
             "cip": {"ip": "192.168.4.7"},
         },
@@ -60,13 +54,7 @@ def test_channel_export_imports_one_merged_echo_tango_document(monkeypatch):
     )
 
     sync.export_channel_configuration(
-        {
-            "threshold": "42",
-            "silence": "1600",
-            "min_rec": "1200",
-            "max_rec": "25000",
-            "audio_gain": "4",
-        },
+        {"threshold": "42", "silence": "1600", "min_rec": "1200", "max_rec": "25000", "audio_gain": "4"},
         {"port": port},
     )
 
@@ -74,13 +62,7 @@ def test_channel_export_imports_one_merged_echo_tango_document(monkeypatch):
     command, payload = commands[0].split(" ", 1)
     assert command == "IMPORT"
     imported = json.loads(payload)
-    assert imported["a"] == {
-        "ath": 42,
-        "stm": 1600,
-        "mrm": 1200,
-        "xrm": 25000,
-        "cg": 4,
-    }
+    assert imported["a"] == {"ath": 42, "stm": 1600, "mrm": 1200, "xrm": 25000, "cg": 4}
     assert imported["w"] == [{"ss": "field-network", "pw": "secret"}]
     assert imported["u"] == {"en": [True, False]}
 
@@ -135,16 +117,14 @@ def test_monitor_requests_and_applies_one_initial_export(monkeypatch):
     recorder_monitor._last_channel_check_time.clear()
     recorder_monitor._last_known_mac.clear()
 
+    # The real firmware wraps EXPORT configuration in {"status":"ok","data":{...}}.
+    exported_config = {"a": {"ath": 42}, "mac": mac}
     recorder_monitor._add_message(port, json.dumps({"ty": "short", "mc": mac}))
-    recorder_monitor._add_message(port, json.dumps({"audio": {"threshold": 42}}))
+    recorder_monitor._add_message(port, json.dumps({"status": "ok", "data": exported_config}))
     recorder_monitor._add_message(port, json.dumps({"ty": "short", "mc": mac}))
 
     assert requested == [(port, "EXPORT")]
-    assert imported == [(
-        {"id": 7, "mac": mac},
-        {"port": port},
-        {"audio": {"threshold": 42}},
-    )]
+    assert imported == [({"id": 7, "mac": mac}, {"port": port}, exported_config)]
     assert port not in recorder_monitor._pending_config_exports
 
 
@@ -196,11 +176,7 @@ def test_serial_transport_uses_export_and_import_commands(monkeypatch):
     monkeypatch.setattr(transport.time, "sleep", Mock())
 
     assert transport.read_recorder_config("/dev/ttyUSB0") == {"a": {"ath": 42}}
-    transport.write_recorder_config(
-        "/dev/ttyUSB0", {"a": {"ath": 55}, "u": {"en": [True]}}
-    )
+    transport.write_recorder_config("/dev/ttyUSB0", {"a": {"ath": 55}, "u": {"en": [True]}})
 
     assert connections[0].writes == [b"EXPORT\n"]
-    assert connections[1].writes == [
-        b'IMPORT {"a":{"ath":55},"u":{"en":[true]}}\n'
-    ]
+    assert connections[1].writes == [b'IMPORT {"a":{"ath":55},"u":{"en":[true]}}\n']
