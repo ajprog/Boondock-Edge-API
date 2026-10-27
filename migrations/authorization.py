@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 from app.utils.sqlite_utils import connect_sqlite
 
 DEFAULT_GROUP_NAME = "Default"
-MIGRATION_NAME = "2026_09_authorization_phase_1_complete"
 
 
 def _now_iso():
@@ -55,12 +54,6 @@ def _permissions(value):
 
 
 def _create_authorization_tables(connection):
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS schema_migrations (
-            name TEXT PRIMARY KEY,
-            applied_at TEXT NOT NULL
-        )
-    """)
     connection.execute("""
         CREATE TABLE IF NOT EXISTS groups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -174,12 +167,6 @@ def upgrade_authorization_schema(db_path):
     try:
         connection.execute("BEGIN IMMEDIATE")
         _create_authorization_tables(connection)
-        if connection.execute(
-            "SELECT 1 FROM schema_migrations WHERE name=?", (MIGRATION_NAME,)
-        ).fetchone():
-            connection.commit()
-            return False
-
         if "groups" not in _columns(connection, "users"):
             connection.execute(
                 "ALTER TABLE users ADD COLUMN groups TEXT NOT NULL DEFAULT '[]'"
@@ -213,7 +200,7 @@ def upgrade_authorization_schema(db_path):
                     group_id = cursor.lastrowid
                 profile_ids[profile["name"]] = group_id
 
-        if _table_exists(connection, "users"):
+        if "profile" in _columns(connection, "users"):
             for user in connection.execute("SELECT email, role, profile FROM users").fetchall():
                 group_ids = [] if user["role"] == "admin" else [
                     profile_ids.get(user["profile"], default_group_id)
@@ -224,7 +211,7 @@ def upgrade_authorization_schema(db_path):
                 )
             connection.execute("ALTER TABLE users DROP COLUMN profile")
 
-        if _table_exists(connection, "channels"):
+        if _table_exists(connection, "profiles") and _table_exists(connection, "channels"):
             connection.execute(
                 """INSERT OR IGNORE INTO channel_owners
                    (channel_id, owner_type, owner_id)
@@ -236,10 +223,6 @@ def upgrade_authorization_schema(db_path):
         connection.execute("DROP TABLE IF EXISTS tokens")
         connection.execute("DROP TABLE IF EXISTS profiles")
 
-        connection.execute(
-            "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
-            (MIGRATION_NAME, _now_iso()),
-        )
         connection.commit()
         return True
     except Exception:

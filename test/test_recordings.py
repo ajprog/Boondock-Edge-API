@@ -1,8 +1,49 @@
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from config import DATA_ROOT
 from app.routes import recordings_routes
+
+
+@pytest.mark.parametrize('role', ['admin', 'member'])
+@pytest.mark.parametrize('show_duplicates,show_hallucinations', [
+    (False, False), (True, False), (False, True), (True, True),
+])
+def test_inbox_visibility_is_admin_only(
+    recording_store, admin_auth, role, show_duplicates, show_hallucinations
+):
+    from flask import Flask
+    from app.services.channel_state import load_inbox
+
+    database, _ = recording_store
+    for recording_id in (1, 2, 3):
+        _insert_recording(
+            database, recording_id, f'recordings/{recording_id}.wav',
+            timestamp=recording_id, is_duplicate=int(recording_id == 2),
+        )
+    with sqlite3.connect(database) as connection:
+        connection.execute('UPDATE recordings SET is_hallucination = TRUE WHERE id = 3')
+
+    principal = {
+        'type': 'user', 'role': role, 'owner_ids': None,
+        'preferences': {'inbox': {
+            'show_duplicate_recordings': show_duplicates,
+            'show_hallucinations': show_hallucinations,
+        }},
+    }
+    with Flask(__name__).test_request_context('/?limit=20'):
+        body, status = load_inbox(principal)
+
+    expected = {1}
+    if role == 'admin' and show_duplicates:
+        expected.add(2)
+    if role == 'admin' and show_hallucinations:
+        expected.add(3)
+    assert status == 200
+    assert {row['id'] for row in body['messages']} == expected
+    assert body['meta']['total'] == len(expected)
 
 
 def _insert_recording(
@@ -117,6 +158,99 @@ def test_recordings_inbox_poll_uses_updated_boundary_and_offset(
         headers=admin_auth,
     )
     assert [message["id"] for message in second.get_json()["messages"]] == [2]
+
+
+@pytest.mark.parametrize('role,show_hallucinations,removed', [
+    ('admin', False, True), ('admin', True, False),
+    ('member', False, True), ('member', True, True),
+])
+def test_inbox_poll_reports_late_hallucination(
+    recording_store, admin_auth, role, show_hallucinations, removed
+):
+    from flask import Flask
+    from app.services.channel_state import load_inbox
+    from app.services.recording_state import update_transcription
+
+    database, _ = recording_store
+    _insert_recording(database, 1, 'recordings/1.wav', timestamp=1000, updated_at=5000)
+    principal = {
+        'type': 'user', 'role': role, 'owner_ids': None,
+        'preferences': {'inbox': {'show_hallucinations': show_hallucinations}},
+    }
+    app = Flask(__name__)
+    with app.test_request_context('/?limit=20'):
+        initial, status = load_inbox(principal)
+    assert status == 200
+    assert [row['id'] for row in initial['messages']] == [1]
+
+    # A successful empty transcription classifies an already displayed row.
+    with sqlite3.connect(database) as connection:
+        assert update_transcription(connection, 1, '')
+        updated_at = connection.execute(
+            'SELECT updated_at FROM recordings WHERE id = 1'
+        ).fetchone()[0]
+    with app.test_request_context('/?updated_since=5000&limit=20'):
+        body, status = load_inbox(principal)
+    assert status == 200
+    assert body['removed_ids'] == ([1] if removed else [])
+    assert [row['id'] for row in body['messages']] == ([] if removed else [1])
+    assert body['meta']['total'] == (0 if removed else 1)
+    assert body['meta']['latest_updated_at'] == updated_at
+
+    # Removing the classification must also make the recording reappear.
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            'UPDATE recordings SET is_hallucination = FALSE, updated_at = ? WHERE id = 1',
+            (updated_at + 1,),
+        )
+    with app.test_request_context(f'/?updated_since={updated_at}&limit=20'):
+        restored, status = load_inbox(principal)
+    assert status == 200
+    assert restored['removed_ids'] == []
+    assert [row['id'] for row in restored['messages']] == [1]
+
+
+def test_inbox_poll_pages_removals_and_visible_rows_together(recording_store, admin_auth):
+    from app import create_app
+
+    database, _ = recording_store
+    for recording_id in (1, 2, 3):
+        _insert_recording(
+            database, recording_id, f'recordings/{recording_id}.wav',
+            timestamp=recording_id, updated_at=5000 + recording_id,
+            is_duplicate=int(recording_id == 1),
+        )
+    with sqlite3.connect(database) as connection:
+        connection.execute('UPDATE recordings SET is_hallucination = TRUE WHERE id = 2')
+    client = create_app().test_client()
+    for offset in (0, 1, 2):
+        response = client.get(
+            f'/api/recordings/inbox?updated_since=5000&limit=1&offset={offset}',
+            headers=admin_auth,
+        )
+        assert response.status_code == 200
+        body = response.get_json()
+        assert body['removed_ids'] == ([offset + 1] if offset < 2 else [])
+        assert [row['id'] for row in body['messages']] == ([] if offset < 2 else [3])
+        assert body['meta']['total'] == 1
+        assert body['meta']['latest_updated_at'] == 5001 + offset
+        assert body['meta']['has_more'] == (offset < 2)
+        assert body['meta']['next_offset'] == (offset + 1 if offset < 2 else None)
+
+
+def test_inbox_poll_removals_obey_channel_filter(recording_store, admin_auth):
+    from app import create_app
+
+    database, _ = recording_store
+    _insert_recording(database, 1, 'recordings/1.wav', channel_id=1,
+                      timestamp=1000, updated_at=5000, is_duplicate=1)
+    _insert_recording(database, 2, 'recordings/2.wav', channel_id=2,
+                      timestamp=1000, updated_at=5000, is_duplicate=1)
+    response = create_app().test_client().get(
+        '/api/recordings/inbox?updated_since=5000&channel_ids=1', headers=admin_auth,
+    )
+    assert response.status_code == 200
+    assert response.get_json()['removed_ids'] == [1]
 
 
 def test_removed_recording_collection_routes_are_not_available(

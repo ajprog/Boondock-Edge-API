@@ -119,6 +119,13 @@ administrator and installation preferences. If a Boondock Edge USB device is
 selected and connected, setup also attempts to configure the compatible serial
 device with the saved host network settings.
 
+Setup also imports the bundled phrases in `app/services/hallucinations.txt`
+into the hallucination-pattern database. These defaults match the whole
+transcript, ignoring case and surrounding whitespace, so words such as `you`
+do not flag otherwise valid sentences. Repeated setup skips defaults already
+present and preserves custom patterns. This import does not reclassify existing
+recordings; classification occurs when transcription text is saved.
+
 > [!CAUTION]
 > `setup.json` contains credentials. Do not commit it, share it, or leave it
 > readable by other users. Delete it or move it to a protected location after

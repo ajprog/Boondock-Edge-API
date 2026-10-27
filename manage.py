@@ -19,7 +19,12 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from config import Config, DATA_ROOT
+from config import Config, CODE_ROOT, DATA_ROOT
+from release_metadata import (
+    atomic_write_json, manifest_lock, parse_version, read_build_info, read_json_object,
+)
+
+CODE_ROOT = Path(__file__).resolve().parent
 
 LOGGER = logging.getLogger("boondock.setup")
 
@@ -33,6 +38,37 @@ MESSAGE_SORTING = {"newest", "oldest"}
 
 class SetupError(ValueError):
     """Raised when setup.json is missing or contains an invalid option."""
+
+
+def import_hallucination_defaults(settings_manager: Any) -> int:
+    """Add bundled phrases as whole-transcript rules without replacing custom rules."""
+    path = CODE_ROOT / "app" / "services" / "hallucinations.txt"
+    phrases = path.read_text(encoding="utf-8").splitlines()
+    existing = {
+        item["pattern"].casefold()
+        for item in settings_manager.get_all_hallucinations()
+        if item["match_type"] == "regex" and not item["case_sensitive"]
+    }
+    imported = 0
+    for line in phrases:
+        phrase = line.strip()
+        if not phrase:
+            continue
+        # Escape punctuation and URLs; short phrases must not match inside
+        # otherwise valid radio traffic. Whitespace around a result is harmless.
+        pattern = r"\A\s*" + re.escape(phrase) + r"\s*\Z"
+        if pattern.casefold() in existing:
+            continue
+        if settings_manager.save_hallucination({
+            "pattern": pattern,
+            "match_type": "regex",
+            "case_sensitive": False,
+        }) < 0:
+            raise RuntimeError("Unable to import bundled hallucination patterns")
+        existing.add(pattern.casefold())
+        imported += 1
+    LOGGER.info("Imported %s bundled hallucination patterns", imported)
+    return imported
 
 
 def load_setup(path: Path) -> dict[str, Any]:
@@ -145,6 +181,7 @@ def initialize(setup: dict[str, Any]) -> None:
 
     initialize_settings_database()
     settings_manager = get_settings_manager()
+    import_hallucination_defaults(settings_manager)
     admin = setup["admin"]
     preferences = setup["preferences"]
     existing_admin = settings_manager.get_user(admin["email"]) or {}
@@ -196,16 +233,31 @@ def initialize(setup: dict[str, Any]) -> None:
     LOGGER.info("API setup completed successfully in %s", DATA_ROOT)
 
 def upgrade() -> None:
-    """Apply versioned migrations without running installation setup."""
+    """Apply every migration after the installed version, then commit metadata."""
     from migrations.authorization import upgrade_authorization_schema
     from migrations.dashboard_cutover import upgrade_dashboard_schema
 
-    upgrade_authorization_schema(Config.get_settings_db_path())
-    upgrade_dashboard_schema(
-        Config.get_settings_db_path(),
-        Config.get_recordings_db_path(),
-    )
+    build_info = read_build_info(CODE_ROOT)
+    with manifest_lock(DATA_ROOT):
+        path = DATA_ROOT / "manifest.json"
+        manifest = read_json_object(path, missing_ok=True)
+        installed = manifest.get("api") or {}
+        if not isinstance(installed, dict):
+            raise ValueError("manifest.api must be an object")
+        version = installed.get("version")
+        current = parse_version(version) if version else None
 
+        # Both existing migrations predate the manifest.
+        if current is None:
+            upgrade_authorization_schema(Config.get_settings_db_path())
+            upgrade_dashboard_schema(
+                Config.get_settings_db_path(), Config.get_recordings_db_path(),
+            )
+
+        # Add future migrations here with independent version checks, in order.
+
+        manifest["api"] = build_info
+        atomic_write_json(path, manifest)
     LOGGER.info("API upgrade completed successfully in %s", DATA_ROOT)
 
 
@@ -245,8 +297,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "upgrade":
             upgrade()
 
-    except SetupError as exc:
-        LOGGER.error("Setup failed: %s", exc)
+    except (ValueError, OSError, RuntimeError) as exc:
+        LOGGER.error("%s failed: %s", args.command, exc)
         return 1
 
     return 0

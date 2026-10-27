@@ -1,68 +1,53 @@
-"""
-Full-stack release upload and rollback (admin only).
-"""
+"""Administrator-only component release discovery, installation, and rollback."""
 import logging
+
 from flask import Blueprint, jsonify, request
+
 from ..middleware.auth_middleware import require_admin
 from ..services import release_package_service
 
 log = logging.getLogger(__name__)
-
 release_package_bp = Blueprint("release_package", __name__)
+
+
+def _respond(operation):
+    try:
+        return jsonify(operation())
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except (OSError, RuntimeError) as exc:
+        log.exception("Release operation failed")
+        return jsonify({"error": "Release operation failed; inspect the service log"}), 500
 
 
 @release_package_bp.route("/version/status", methods=["GET"])
 @require_admin
 def version_status():
-    """Current release metadata and list of on-disk backup snapshots."""
-    return jsonify(release_package_service.get_status())
+    return _respond(release_package_service.get_status)
+
+
+@release_package_bp.route("/version/releases", methods=["GET"])
+@require_admin
+def version_releases():
+    component = request.args.get("component", "api")
+    return _respond(lambda: {"component": component,
+                             "releases": release_package_service.list_releases(component)})
 
 
 @release_package_bp.route("/version/apply", methods=["POST"])
 @require_admin
 def version_apply():
-    """
-    Multipart: field "file" = release .zip
-    JSON body (optional) or form: install_dependencies=true
-    """
-    f = request.files.get("file")
-    if f is None or f.filename is None or f.filename.strip() == "":
-        return jsonify({"error": "Missing file field in multipart form"}), 400
-
-    raw = f.read()
-    if not raw:
-        return jsonify({"error": "Empty file"}), 400
-
-    inst = request.form.get("install_dependencies", "").lower() in ("1", "true", "yes")
-    if not inst:
-        inst = request.args.get("install_dependencies", "").lower() in ("1", "true", "yes")
-
-    try:
-        out = release_package_service.apply_release_package(
-            raw, install_dependencies=inst
-        )
-        return jsonify(out)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except OSError as e:
-        log.exception("Release apply failed (OS error)")
-        return jsonify({"error": str(e)}), 500
+    data = request.get_json(silent=True)
+    if (not isinstance(data, dict) or set(data) != {"component", "tag"}
+            or not all(isinstance(value, str) for value in data.values())):
+        return jsonify({"error": "Provide only component and tag as JSON strings"}), 400
+    return _respond(lambda: release_package_service.install_release(data["component"], data["tag"]))
 
 
 @release_package_bp.route("/version/rollback", methods=["POST"])
 @require_admin
 def version_rollback():
-    data = request.get_json(silent=True) or {}
-    if not isinstance(data, dict):
-        return jsonify({"error": "JSON body required"}), 400
-    backup_id = (data.get("backup_id") or data.get("id") or "").strip()
-    if not backup_id:
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not isinstance(data.get("backup_id"), str):
         return jsonify({"error": "backup_id is required"}), 400
-    try:
-        out = release_package_service.rollback(backup_id)
-        return jsonify(out)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except OSError as e:
-        log.exception("Rollback failed (OS error)")
-        return jsonify({"error": str(e)}), 500
+    return _respond(lambda: release_package_service.rollback(data["backup_id"]))

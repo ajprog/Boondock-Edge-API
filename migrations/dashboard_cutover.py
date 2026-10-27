@@ -1,9 +1,7 @@
 """One-time dashboard-contract database cutover.
 
-Unlike the clean-install initializers, this module contains every compatibility
-operation needed by an existing installation.  It deliberately does not use
-``schema_migrations``: schema shape and the absence of legacy data make each
-operation idempotent until a dedicated database versioning system is adopted.
+Schema shape and the absence of legacy data make operations idempotent.
+The persistent Edge manifest controls upgrade selection.
 """
 from __future__ import annotations
 

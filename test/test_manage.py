@@ -66,6 +66,12 @@ def _initialize_and_capture_settings(monkeypatch, tmp_path, document):
     autoconfigured = []
 
     class SettingsManager:
+        def get_all_hallucinations(self):
+            return []
+
+        def save_hallucination(self, pattern):
+            return 1
+
         def get_user(self, email):
             return None
 
@@ -168,3 +174,35 @@ def test_auto_configures_all_connected_edge_usb_devices(monkeypatch):
         ("/dev/ttyUSB0", "boondockedge", "edge@123", "10.42.0.1", "4000"),
         ("/dev/ttyUSB1", "boondockedge", "edge@123", "10.42.0.1", "4000"),
     ]
+
+
+def test_install_imports_bundled_hallucinations_without_duplicates(
+    initialized_settings_manager,
+):
+    from app.services.recording_state import is_hallucination
+
+    manager = initialized_settings_manager
+    custom_id = manager.save_hallucination({'pattern': 'custom phrase'})
+    imported = manage.import_hallucination_defaults(manager)
+    assert imported > 0
+    assert manage.import_hallucination_defaults(manager) == 0
+    patterns = manager.get_all_hallucinations()
+    assert len(patterns) == imported + 1
+    assert next(item for item in patterns if item['id'] == custom_id)['pattern'] == 'custom phrase'
+    assert is_hallucination(' THANK YOU ', patterns)
+    assert is_hallucination('You.', patterns)
+    assert is_hallucination('...', patterns)
+    assert is_hallucination('www.globalonenessproject.org', patterns)
+    assert not is_hallucination('Can you check the radio?', patterns)
+    assert not is_hallucination('Thank you for the update, car stopped.', patterns)
+    assert not is_hallucination('wwwXglobalonenessprojectYorg', patterns)
+
+
+def test_install_normalizes_bundled_phrase_lines(
+    monkeypatch, tmp_path, initialized_settings_manager
+):
+    phrase_file = tmp_path / 'app' / 'services' / 'hallucinations.txt'
+    phrase_file.parent.mkdir(parents=True)
+    phrase_file.write_text('Thank you\n thank you \n\nTHANK YOU\nBye\n', encoding='utf-8')
+    monkeypatch.setattr(manage, 'CODE_ROOT', tmp_path)
+    assert manage.import_hallucination_defaults(initialized_settings_manager) == 2

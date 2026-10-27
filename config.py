@@ -56,6 +56,14 @@ def _stable_secret_key() -> str:
 
 
 class Config:
+    # Official release repositories; environment overrides are optional.
+    API_REPOSITORY = os.environ.get(
+        "BOONDOCK_API_REPOSITORY", "Boondock-Echo/Boondock-Edge-API"
+    )
+    DASHBOARD_REPOSITORY = os.environ.get(
+        "BOONDOCK_DASHBOARD_REPOSITORY", "Boondock-Echo/Boondock-Edge-Dashboard"
+    )
+
     FLASK_HOST = '0.0.0.0'
     FLASK_PORT = int(os.environ.get('FLASK_PORT', '4000'))
     CHANNELS = 6

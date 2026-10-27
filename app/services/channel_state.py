@@ -359,24 +359,31 @@ def load_inbox(principal, value=None, id_argument=None):
             raise ValueError('offset must not be negative')
 
         inbox_preferences = principal.get('preferences', {}).get('inbox', {})
-        if not inbox_preferences.get('show_duplicate_recordings', False):
-            base_clauses.append('recordings.is_duplicate = FALSE')
-        if not inbox_preferences.get('show_hallucinations', False):
-            base_clauses.append('recordings.is_hallucination = FALSE')
+        is_admin = principal.get('type') == 'user' and principal.get('role') == 'admin'
+        show_duplicates = is_admin and inbox_preferences.get('show_duplicate_recordings') is True
+        show_hallucinations = is_admin and inbox_preferences.get('show_hallucinations') is True
+        visibility_clauses = []
+        if not show_duplicates:
+            visibility_clauses.append('recordings.is_duplicate = FALSE')
+        if not show_hallucinations:
+            visibility_clauses.append('recordings.is_hallucination = FALSE')
         if limit is None:
             preferred = inbox_preferences.get('records_per_page', 20)
             limit = preferred if isinstance(preferred, int) and preferred > 0 else 100
         if limit < 1 or limit > 500:
             raise ValueError('limit must be between 1 and 500')
 
-        where = ' AND '.join(base_clauses) if base_clauses else '1'
+        visible_clauses = base_clauses + visibility_clauses
+        where = ' AND '.join(visible_clauses) if visible_clauses else '1'
         with _recording_connection() as connection:
             total = connection.execute(
                 f"SELECT COUNT(DISTINCT recordings.id) FROM recordings {' '.join(joins)} WHERE {where}",
                 base_parameters,
             ).fetchone()[0]
 
-            clauses = list(base_clauses)
+            # Poll every authorized change, including rows now hidden. Both
+            # messages and removals share one page and one update boundary.
+            clauses = list(base_clauses if updated_since is not None else visible_clauses)
             parameters = list(base_parameters)
             if updated_since is not None:
                 clauses.append('recordings.updated_at >= ?')
@@ -396,7 +403,7 @@ def load_inbox(principal, value=None, id_argument=None):
                 SELECT DISTINCT recordings.id, recordings.channel_id,
                     recordings.filename, recordings.timestamp, recordings.status,
                     recordings.transcription, recordings.duration,
-                    recordings.is_hallucination, recordings.updated_at
+                    recordings.is_hallucination, recordings.is_duplicate, recordings.updated_at
                 FROM recordings {' '.join(joins)}
                 WHERE {' AND '.join(clauses) if clauses else '1'}
                 ORDER BY {order} LIMIT ? OFFSET ?
@@ -404,10 +411,21 @@ def load_inbox(principal, value=None, id_argument=None):
             rows = connection.execute(query, (*parameters, limit + 1, offset)).fetchall()
 
         has_more = len(rows) > limit
-        messages = [dict(row) for row in rows[:limit]]
+        page_rows = rows[:limit]
+        messages = []
+        removed_ids = []
+        for row in page_rows:
+            if ((row['is_duplicate'] and not show_duplicates) or
+                    (row['is_hallucination'] and not show_hallucinations)):
+                removed_ids.append(row['id'])
+            else:
+                message = dict(row)
+                message.pop('is_duplicate')
+                messages.append(message)
         last = messages[-1] if messages else None
         return ({
             'messages': messages,
+            **({'removed_ids': removed_ids} if updated_since is not None else {}),
             'notifications': get_active_notifications(),
             'meta': {
                 'total': total,
@@ -417,6 +435,9 @@ def load_inbox(principal, value=None, id_argument=None):
                 ),
                 'next_before_id': last['id'] if has_more and updated_since is None else None,
                 'next_offset': offset + limit if has_more and updated_since is not None else None,
+                **({'latest_updated_at': max(
+                    (row['updated_at'] for row in page_rows), default=updated_since,
+                )} if updated_since is not None else {}),
             },
         }, 200)
     except ValueError as error:

@@ -23,9 +23,6 @@ def _create_database_schema():
     conn = connect_sqlite(Config.get_settings_db_path(), row_factory=True)
     try:
         cursor = conn.cursor()
-        is_new_database = cursor.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'"
-        ).fetchone() is None
 
         # Settings table (key-value pairs)
         cursor.execute('''
@@ -176,19 +173,6 @@ def _create_database_schema():
                 FOREIGN KEY (channel_id) REFERENCES channels(id) ON DELETE CASCADE
             )
         ''')
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                name TEXT PRIMARY KEY,
-                applied_at TEXT NOT NULL
-            )
-        ''')
-        if is_new_database:
-            cursor.execute(
-                '''INSERT INTO schema_migrations(name, applied_at)
-                   VALUES ('2026_09_authorization_phase_1_complete', ?)''',
-                (datetime.now(timezone.utc).isoformat(),)
-            )
-
         # Branding table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS branding (

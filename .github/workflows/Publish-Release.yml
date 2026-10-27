@@ -18,8 +18,8 @@ on:
         type: string
 
       version:
-        description: Numbered tag, required for numbered releases (example v2.0.0-beta.02)
-        required: false
+        description: Application version (2.0.0-beta.01d for beta, v2.0.0-beta.01 for numbered)
+        required: true
         type: string
 
       display_name:
@@ -61,7 +61,11 @@ jobs:
 
           if [[ "$RELEASE_TYPE" == "beta" ]]; then
             TAG="beta"
-            VERSION="$DISPLAY_NAME"
+            VERSION="${VERSION_INPUT#v}"
+            if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-beta\.[0-9]+[a-z]*$ ]]; then
+              echo "Beta requires a machine version such as 2.0.0-beta.01d" >&2
+              exit 1
+            fi
             PRERELEASE="true"
           elif [[ "$RELEASE_TYPE" == "numbered" ]]; then
             TAG="$VERSION_INPUT"
@@ -71,7 +75,7 @@ jobs:
               exit 1
             fi
 
-            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+)?$ ]]; then
+            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-beta\.[0-9]+[a-z]*)?$ ]]; then
               echo "Invalid numbered tag: $TAG" >&2
               echo "Expected vX.Y.Z or vX.Y.Z-beta.N" >&2
               exit 1
@@ -104,7 +108,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG"; then
+          EXISTING_TAG="$(git ls-remote --tags origin "refs/tags/$TAG")"
+          if [[ -n "$EXISTING_TAG" ]]; then
             echo "The numbered tag already exists: $TAG" >&2
             echo "Numbered release tags are immutable." >&2
             exit 1
@@ -171,33 +176,11 @@ jobs:
               "github_run_attempt": int(os.environ["RUN_ATTEMPT"]),
           }
 
-          Path("app/build-info.json").write_text(
+          Path("build-info.json").write_text(
               json.dumps(build_info, indent=2) + "\n",
               encoding="utf-8",
           )
 
-          manifest = {
-              "format": "boondock-edge-release",
-              "format_version": 1,
-              **build_info,
-              "build_id": os.environ["COMMIT"],
-              "components": {
-                  "api": {
-                      "path": "api",
-                      "files": [
-                          "run.py",
-                          "config.py",
-                          "manage.py",
-                          "requirements.txt",
-                      ],
-                  },
-              },
-          }
-
-          Path("manifest.json").write_text(
-              json.dumps(manifest, indent=2) + "\n",
-              encoding="utf-8",
-          )
           PY
 
       - name: Assemble API package
@@ -218,14 +201,16 @@ jobs:
           cp config.py "$PACKAGE_DIR/api/"
           cp manage.py "$PACKAGE_DIR/api/"
           cp requirements.txt "$PACKAGE_DIR/api/"
-          cp manifest.json "$PACKAGE_DIR/"
+          cp build-info.json release_metadata.py "$PACKAGE_DIR/api/"
+          cp -a migrations "$PACKAGE_DIR/api/migrations"
+          find "$PACKAGE_DIR" -type d -name __pycache__ -prune -exec rm -rf {} +
+          rm -f "$PACKAGE_DIR/api/build-info.json"
 
           tar \
             --create \
             --gzip \
             --file "$ARCHIVE" \
             --directory "$PACKAGE_DIR" \
-            manifest.json \
             api
 
           sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
@@ -384,6 +369,7 @@ jobs:
             else
               gh release edit latest \
                 --title "$DISPLAY_NAME" \
+                --prerelease=false \
                 --latest
             fi
           else

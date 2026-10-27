@@ -1,31 +1,41 @@
-"""
-Apply full-stack release packages (zip): dashboard (React build) + api (Python app).
-Backups and rollback live under api/.release_backups/
-"""
+"""Install independently versioned GitHub component TAR releases with rollback."""
 from __future__ import annotations
 
-import json
-import logging
+import fcntl
+import gzip
+import hashlib
+import io
+import os
 import re
 import shutil
-import tempfile
+import sqlite3
 import subprocess
 import sys
+import tarfile
+import tempfile
+import time
 import uuid
-import zipfile
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Optional, Tuple
+import zlib
+from contextlib import closing, contextmanager
+from pathlib import Path, PurePosixPath
+from urllib.parse import quote, urlparse
 
-log = logging.getLogger(__name__)
+import requests
 
-FORMAT_ID = "boondock-edge-release"
-MAX_ZIP_BYTES = 200 * 1024 * 1024
-MAX_UNCOMPRESSED_BYTES = 1 * 1024 * 1024 * 1024
+from config import Config, DATA_ROOT
+from release_metadata import (
+    atomic_write_json, manifest_lock, parse_version, read_build_info,
+    read_json_object, update_component,
+)
+
+MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024
+MAX_UNCOMPRESSED_BYTES = 1024 * 1024 * 1024
 MAX_EXTRACTED_FILES = 50_000
 BACKUP_RETENTION = 5
-
-_STATE_NAME = "state.json"
+API_FILES = (
+    "app", "migrations", "run.py", "config.py", "manage.py", "requirements.txt",
+    "release_metadata.py", "build-info.json",
+)
 
 
 def api_root() -> Path:
@@ -33,395 +43,387 @@ def api_root() -> Path:
 
 
 def backups_dir() -> Path:
-    d = api_root() / ".release_backups"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+    # Persistent state must survive replacement of application code.
+    path = DATA_ROOT / ".release_backups"
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return path
 
 
-def state_path() -> Path:
-    return backups_dir() / _STATE_NAME
+def _state_path() -> Path:
+    return backups_dir() / "state.json"
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+def _load_state() -> dict:
+    state = read_json_object(_state_path(), missing_ok=True)
+    state.setdefault("backups", [])
+    return state
 
 
-def _load_state() -> dict[str, Any]:
-    p = state_path()
-    if not p.is_file():
-        return {"backups": [], "current": None, "format": FORMAT_ID}
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if not isinstance(data, dict):
-            return {"backups": [], "current": None, "format": FORMAT_ID}
-        data.setdefault("backups", [])
+@contextmanager
+def _installation_lock():
+    with (backups_dir() / ".install.lock").open("a") as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("Another installation or rollback is in progress") from exc
+        try:
+            yield
+        finally:
+            fcntl.flock(stream, fcntl.LOCK_UN)
+
+
+def get_status() -> dict:
+    return {
+        "installed": read_json_object(DATA_ROOT / "manifest.json", missing_ok=True),
+        "backups": _load_state()["backups"],
+    }
+
+
+def _repository(component: str) -> str:
+    if component not in ("api", "dashboard"):
+        raise ValueError("component must be api or dashboard")
+    repo = getattr(Config, f"{component.upper()}_REPOSITORY", "")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        raise ValueError(f"Configure BOONDOCK_{component.upper()}_REPOSITORY as owner/repository")
+    return repo
+
+
+def _validate_tag(tag: str) -> str:
+    if tag in ("latest", "beta"):
+        return tag
+    if not isinstance(tag, str) or not tag.startswith("v"):
+        raise ValueError("Select latest, beta, or a numbered vX.Y.Z release tag")
+    parse_version(tag)
+    return tag
+
+
+def _download(url: str, *, limit: int, asset: bool = False) -> bytes:
+    """Bound downloads, including chunked responses, and constrain redirects."""
+    deadline = time.monotonic() + 120
+    for _ in range(5):
+        parsed = urlparse(url)
+        hosts = {"github.com", "release-assets.githubusercontent.com"} if asset else {"api.github.com"}
+        if (parsed.scheme != "https" or parsed.hostname not in hosts
+                or parsed.username or parsed.password or parsed.port not in (None, 443)):
+            raise ValueError("Untrusted GitHub download URL")
+        try:
+            with requests.get(url, stream=True, timeout=(10, 30), allow_redirects=False,
+                              headers={"Accept": "application/vnd.github+json"} if not asset else {}) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    url = response.headers.get("Location", "")
+                    continue
+                response.raise_for_status()
+                length = response.headers.get("Content-Length")
+                if length is not None and int(length) > limit:
+                    raise ValueError("Download exceeds size limit")
+                result = bytearray()
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if len(result) + len(chunk) > limit:
+                        raise ValueError("Download exceeds size limit")
+                    if time.monotonic() > deadline:
+                        raise ValueError("Download exceeded time limit")
+                    result.extend(chunk)
+                return bytes(result)
+        except requests.RequestException as exc:
+            raise RuntimeError("Unable to retrieve the selected GitHub release") from exc
+    raise ValueError("Too many GitHub download redirects")
+
+
+def _github_json(path: str):
+    import json
+    return json.loads(_download(f"https://api.github.com/{path}", limit=4 * 1024 * 1024))
+
+
+def _asset_names(component: str, tag: str) -> tuple[str, str]:
+    name = f"boondock-edge-{component}-{tag}.tar.gz"
+    return name, name + ".sha256"
+
+
+def _assets(release: dict, component: str, tag: str) -> tuple[dict, dict]:
+    result = []
+    for name in _asset_names(component, tag):
+        matches = [item for item in release.get("assets", []) if item.get("name") == name]
+        if len(matches) != 1:
+            raise ValueError(f"Release must contain exactly one {name}")
+        result.append(matches[0])
+    return tuple(result)
+
+
+def list_releases(component: str) -> list[dict]:
+    repo = _repository(component)
+    result = []
+    for page in range(1, 11):
+        releases = _github_json(f"repos/{repo}/releases?per_page=100&page={page}")
+        if not isinstance(releases, list):
+            raise ValueError("Invalid GitHub release listing")
+        for release in releases:
+            if release.get("draft"):
+                continue
+            tag = release.get("tag_name", "")
+            try:
+                _validate_tag(tag)
+                _assets(release, component, tag)
+            except ValueError:
+                continue
+            result.append({"tag": tag, "display_name": release.get("name") or tag,
+                           "prerelease": bool(release.get("prerelease")),
+                           "published_at": release.get("published_at")})
+        if len(releases) < 100:
+            break
+    return result
+
+
+def _release_download(component: str, tag: str) -> tuple[bytes, str]:
+    repo = _repository(component)
+    _validate_tag(tag)
+    release = _github_json(f"repos/{repo}/releases/tags/{quote(tag, safe='')}")
+    if release.get("draft") or release.get("tag_name") != tag:
+        raise ValueError("Selected release is unavailable")
+    archive, checksum = _assets(release, component, tag)
+    for asset in (archive, checksum):
+        expected = f"https://github.com/{repo}/releases/download/{quote(tag, safe='')}/{asset['name']}"
+        if asset.get("browser_download_url") != expected:
+            raise ValueError("Release asset does not belong to the configured repository")
+    checksum_data = _download(checksum["browser_download_url"], limit=4096, asset=True).decode("ascii")
+    match = re.fullmatch(r"([0-9a-fA-F]{64}) [ *]([^\r\n]+)\n?", checksum_data)
+    if not match or match[2] != archive["name"]:
+        raise ValueError("Invalid release checksum file")
+    data = _download(archive["browser_download_url"], limit=MAX_DOWNLOAD_BYTES, asset=True)
+    if hashlib.sha256(data).hexdigest() != match[1].lower():
+        raise ValueError("Release checksum mismatch")
+    return data, repo
+
+
+class _LimitedReader:
+    def __init__(self, stream, limit):
+        self.stream = stream
+        self.remaining = limit
+
+    def read(self, size=-1):
+        size = min(size if size >= 0 else self.remaining + 1, self.remaining + 1)
+        data = self.stream.read(size)
+        self.remaining -= len(data)
+        if self.remaining < 0:
+            raise ValueError("Decompressed TAR exceeds size limit")
         return data
-    except (json.JSONDecodeError, OSError) as e:
-        log.warning("Could not read release state: %s", e)
-        return {"backups": [], "current": None, "format": FORMAT_ID}
 
 
-def _save_state(data: dict[str, Any]) -> None:
-    sp = state_path()
-    with open(sp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-        f.write("\n")
-
-
-def get_status() -> dict[str, Any]:
-    st = _load_state()
-    cur = st.get("current")
-    return {
-        "format": FORMAT_ID,
-        "current": cur,
-        "backups": st.get("backups", []),
-    }
-
-
-def _is_safe_rel(name: str) -> bool:
-    if not name or name.strip() == "":
-        return False
-    parts = name.replace("\\", "/").split("/")
-    for p in parts:
-        if p in ("", ".", ".."):
-            if p == "..":
-                return False
-    if parts[-1] == "..":
-        return False
-    if ".." in parts:
-        return False
-    return not Path(name).is_absolute() if not name.startswith(("/", "\\\\")) else False
-
-
-def _validate_zip_info(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
-    members = zf.infolist()
-    total_uncompressed = 0
-    for i, m in enumerate(members):
-        if i >= MAX_EXTRACTED_FILES:
-            raise ValueError("Too many files in archive (zip bomb?)")
-        if m.is_dir() or m.filename.endswith("/"):
-            continue
-        if not _is_safe_rel(m.filename):
-            raise ValueError(f"Illegal path in archive: {m.filename!r}")
-        if m.file_size < 0:
-            raise ValueError("Invalid file size in archive")
-        total_uncompressed += m.file_size
-        if total_uncompressed > MAX_UNCOMPRESSED_BYTES:
-            raise ValueError("Uncompressed size of archive is too large")
-    return members
-
-
-def _safe_extract_zf(zf: zipfile.ZipFile, dest: Path) -> None:
+def _safe_extract_tar(data: bytes, dest: Path) -> None:
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise ValueError("Archive exceeds size limit")
     dest = dest.resolve()
-    for info in zf.infolist():
-        name = info.filename
-        if name.startswith("/") or (len(name) >= 2 and name[1] == ":"):
-            raise ValueError("Absolute paths are not allowed in the archive")
-        if not _is_safe_rel(name):
-            raise ValueError(f"Path traversal or invalid name: {name!r}")
-        target = (dest / name).resolve()
-        try:
-            target.relative_to(dest)
-        except ValueError as e:
-            raise ValueError("Path would escape destination directory (zip slip)") from e
-    zf.extractall(str(dest))
-
-
-def _read_manifest(extract: Path) -> dict[str, Any]:
-    mpath = extract / "manifest.json"
-    if not mpath.is_file():
-        raise ValueError("manifest.json is missing in the archive (root of zip)")
-    with open(mpath, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    if not isinstance(raw, dict):
-        raise ValueError("manifest.json must be a JSON object")
-    if raw.get("format") != FORMAT_ID:
-        raise ValueError(
-            f'Unsupported or missing "format" (expected "{FORMAT_ID}") in manifest.json'
-        )
-    return raw
-
-
-def _sync_directory(src: Path, dst: Path) -> None:
-    if not src.is_dir():
-        raise ValueError(f"Expected directory: {src}")
-    if dst.exists():
-        shutil.rmtree(dst)
-    shutil.copytree(src, dst)
-
-
-def _copy_file(src: Path, dst: Path) -> None:
-    if not src.is_file():
-        raise ValueError(f"Expected file: {src}")
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dst)
-
-
-def _apply_manifest(extract: Path, manifest: dict[str, Any], br: Path) -> list[str]:
-    log_lines: list[str] = []
-    comp = manifest.get("components", {})
-    if not isinstance(comp, dict):
-        raise ValueError("manifest components must be an object")
-
-    fe = comp.get("dashboard", {})
-    if not isinstance(fe, dict):
-        raise ValueError("components.dashboard must be an object")
-    front_rel = fe.get("path", "dashboard")
-    fsrc = extract / front_rel
-    if not (fsrc / "index.html").is_file():
-        raise ValueError("dashboard folder must contain index.html")
-    fstat = fsrc / "static"
-    fass = fsrc / "assets"
-    if not fstat.is_dir() and not fass.is_dir():
-        raise ValueError("dashboard folder must contain a static/ or assets/ directory")
-    out_build = br / "build"
-    if out_build.exists():
-        shutil.rmtree(out_build)
-    shutil.copytree(fsrc, out_build)
-    log_lines.append("Applied dashboard to build/")
-
-    be = comp.get("api", {})
-    if not isinstance(be, dict):
-        raise ValueError("components.api must be an object")
-    back_rel = be.get("path", "api")
-    bsrc = extract / back_rel
-    ap = bsrc / "app"
-    if not ap.is_dir():
-        raise ValueError("api app/ directory is missing in package")
-    out_app = br / "app"
-    if out_app.exists():
-        shutil.rmtree(out_app)
-    shutil.copytree(ap, out_app)
-    log_lines.append("Applied api app/")
-
-    for fn in be.get("files", ["run.py", "config.py", "requirements.txt"]):
-        p = bsrc / fn
-        if not p.is_file():
-            raise ValueError(f"Required api file missing: {back_rel}/{fn}")
-        _copy_file(p, br / fn)
-        log_lines.append(f"Applied {fn}")
-
-    de = comp.get("docs", {})
-    if isinstance(de, dict) and de.get("include", False) is not False:
-        drel = de.get("path", "docs-build")
-        dsrc = extract / drel
-        if dsrc.is_dir():
-            out_docs = br / "docs-build"
-            if out_docs.exists():
-                shutil.rmtree(out_docs)
-            shutil.copytree(dsrc, out_docs)
-            log_lines.append("Applied docs-build/")
-        else:
-            log_lines.append("docs expected but not present in archive; skipped")
-    return log_lines
-
-
-def _create_snapshot(backup_id: str, br: Path) -> Path:
-    snap = backups_dir() / backup_id / "snapshot"
-    snap.mkdir(parents=True, exist_ok=True)
-    bdir = br / "build"
-    if bdir.is_dir():
-        shutil.copytree(bdir, snap / "build", dirs_exist_ok=True)
-    adir = br / "app"
-    if adir.is_dir():
-        shutil.copytree(adir, snap / "app", dirs_exist_ok=True)
-    for name in ("run.py", "config.py", "requirements.txt"):
-        p = br / name
-        if p.is_file():
-            shutil.copy2(p, snap / name)
-    ddocs = br / "docs-build"
-    if ddocs.is_dir():
-        shutil.copytree(ddocs, snap / "docs-build", dirs_exist_ok=True)
-    return snap
-
-
-def _restore_snapshot(snap: Path, br: Path) -> None:
-    b_from = snap / "build"
-    if b_from.is_dir():
-        _sync_directory(b_from, br / "build")
-    a_from = snap / "app"
-    if a_from.is_dir():
-        _sync_directory(a_from, br / "app")
-    for name in ("run.py", "config.py", "requirements.txt"):
-        p = snap / name
-        if p.is_file():
-            _copy_file(p, br / name)
-    d_from = snap / "docs-build"
-    d_to = br / "docs-build"
-    if d_from.is_dir():
-        if d_to.exists():
-            shutil.rmtree(d_to)
-        shutil.copytree(d_from, d_to)
-    # If snapshot has no docs-build, leave the current site as-is
-
-
-def _prune_backups() -> None:
-    st = _load_state()
-    bks = st.get("backups", [])
-    if len(bks) <= BACKUP_RETENTION:
-        return
-    extra = bks[BACKUP_RETENTION:]
-    st["backups"] = bks[:BACKUP_RETENTION]
-    for entry in extra:
-        bid = entry.get("id")
-        if not bid:
-            continue
-        p = backups_dir() / str(bid)
-        if p.is_dir():
-            shutil.rmtree(p, ignore_errors=True)
-    _save_state(st)
-
-
-def _run_pip_if_requested(br: Path) -> Optional[Tuple[bool, str]]:
-    req = br / "requirements.txt"
-    if not req.is_file():
-        return None
+    dest.mkdir(parents=True, exist_ok=True)
+    total, count = 0, 0
+    seen = set()
     try:
-        proc = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-r", str(req)],
-            cwd=str(br),
-            capture_output=True,
-            text=True,
-            timeout=600,
-        )
-        out = (proc.stdout or "") + (proc.stderr or "")
-        return proc.returncode == 0, out
-    except (subprocess.SubprocessError, OSError) as e:
-        return False, str(e)
+        with gzip.GzipFile(fileobj=io.BytesIO(data)) as compressed:
+            # Also bound decompression of metadata and padding, not just file data.
+            bounded = _LimitedReader(compressed, MAX_UNCOMPRESSED_BYTES + MAX_EXTRACTED_FILES * 2048)
+            with tarfile.open(fileobj=bounded, mode="r|") as archive:
+                for member in archive:
+                    count += 1
+                    if count > MAX_EXTRACTED_FILES:
+                        raise ValueError("Too many files in archive")
+                    name = member.name
+                    parts = PurePosixPath(name).parts
+                    if (not parts or PurePosixPath(name).is_absolute() or ".." in parts
+                            or "\\" in name or re.match(r"^[A-Za-z]:", name)):
+                        raise ValueError("Illegal path in archive")
+                    target = dest.joinpath(*parts)
+                    if not target.resolve().is_relative_to(dest) or target.is_symlink():
+                        raise ValueError("Archive path escapes destination")
+                    if member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.DIRTYPE) or member.sparse is not None:
+                        raise ValueError("Only ordinary files and directories are allowed")
+                    relative = target.relative_to(dest)
+                    if relative in seen:
+                        raise ValueError("Duplicate archive path")
+                    seen.add(relative)
+                    if member.size < 0:
+                        raise ValueError("Invalid TAR member size")
+                    total += member.size
+                    if total > MAX_UNCOMPRESSED_BYTES:
+                        raise ValueError("Extracted archive exceeds size limit")
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with archive.extractfile(member) as source, target.open("xb") as output:
+                            shutil.copyfileobj(source, output, length=64 * 1024)
+                        target.chmod(member.mode & 0o755)
+            # Verify the gzip trailer and bound any padding after TAR end markers.
+            while bounded.read(64 * 1024):
+                pass
+    except (tarfile.TarError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
+        raise ValueError("Invalid .tar.gz release archive") from exc
 
 
-def apply_release_package(
-    zip_data: bytes,
-    *,
-    install_dependencies: bool = False,
-) -> dict[str, Any]:
-    if len(zip_data) > MAX_ZIP_BYTES:
-        raise ValueError(f"Archive too large (max {MAX_ZIP_BYTES} bytes)")
+def _remove(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink(missing_ok=True)
 
-    br = api_root()
-    with tempfile.TemporaryDirectory(prefix="bd_release_") as td:
-        tdp = Path(td)
-        zpath = tdp / "upload.zip"
-        zpath.write_bytes(zip_data)
 
-        with zipfile.ZipFile(zpath) as zf:
-            if zf.testzip() is not None:
-                raise ValueError("Corrupt zip (CRC mismatch)")
-            _validate_zip_info(zf)
-            extract = tdp / "ex"
-            extract.mkdir()
-            _safe_extract_zf(zf, extract)
+def _copy(source: Path, target: Path) -> None:
+    _remove(target)
+    if source.is_dir():
+        shutil.copytree(source, target)
+    elif source.is_file():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
 
-        manifest = _read_manifest(extract)
-        version = str(manifest.get("version", "unknown"))[:200]
-        build_id = str(manifest.get("build_id", "unknown"))[:200]
 
-        pre_snap_id = f"{_utc_now()[:10].replace('-', '')}-{_new_backup_suffix()}"
-        _create_snapshot(pre_snap_id, br)
-        st_pre = _load_state()
-        pre_entry = {
-            "id": pre_snap_id,
-            "version": version,
-            "build_id": build_id,
-            "type": "pre_update",
-            "label": f"Before upgrade to {version}",
-            "created_at": _utc_now(),
-        }
-        st_pre["backups"] = [pre_entry, *[b for b in st_pre.get("backups", []) if b.get("id") != pre_snap_id]]
-        st_pre["backups"] = st_pre["backups"][:20]
-        _save_state(st_pre)
+def _component_paths(component: str) -> tuple[str, ...]:
+    return API_FILES if component == "api" else ("build",)
 
+
+def _sqlite_backup(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + 120
+
+    def progress(status, remaining, total):
+        if time.monotonic() > deadline:
+            raise RuntimeError("Timed out copying the SQLite database")
+
+    with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as origin:
+        with closing(sqlite3.connect(target)) as destination:
+            origin.backup(destination, pages=128, progress=progress, sleep=0.05)
+
+
+def _snapshot(component: str, identifier: str) -> dict:
+    snapshot = backups_dir() / identifier
+    snapshot.mkdir(mode=0o700)
+    files = snapshot / "files"
+    files.mkdir()
+    for name in _component_paths(component):
+        source = api_root() / name
+        if source.exists():
+            _copy(source, files / name)
+    with manifest_lock(DATA_ROOT):
+        manifest = read_json_object(DATA_ROOT / "manifest.json", missing_ok=True)
+        metadata = manifest.get(component)
+    databases = []
+    if component == "api":
+        db_dir = Config.get_db_dir()
+        for database in sorted(db_dir.glob("*.db")):
+            if database.is_file():
+                _sqlite_backup(database, snapshot / "databases" / database.name)
+                databases.append(database.name)
+    entry = {"id": identifier, "component": component, "metadata": metadata,
+             "databases": databases, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+    atomic_write_json(snapshot / "backup.json", entry)
+    return entry
+
+
+def _restore(entry: dict) -> None:
+    component = entry["component"]
+    snapshot = backups_dir() / entry["id"]
+    for name in _component_paths(component):
+        _copy(snapshot / "files" / name, api_root() / name)
+    if component == "api":
+        db_dir = Config.get_db_dir()
+        for database in db_dir.glob("*.db"):
+            if database.name not in entry["databases"]:
+                _remove(database)
+                for suffix in ("-wal", "-shm"):
+                    _remove(Path(str(database) + suffix))
+        for name in entry["databases"]:
+            # SQLite backup restores safely even when WAL files exist.
+            _sqlite_backup(snapshot / "databases" / name, db_dir / name)
+    update_component(DATA_ROOT, component, entry["metadata"])
+
+
+def _record_backup(entry: dict) -> None:
+    state = _load_state()
+    state["backups"] = [entry, *state["backups"]]
+    expired = state["backups"][BACKUP_RETENTION:]
+    state["backups"] = state["backups"][:BACKUP_RETENTION]
+    atomic_write_json(_state_path(), state)
+    for item in expired:
+        shutil.rmtree(backups_dir() / item["id"], ignore_errors=True)
+
+
+def _run_upgrade() -> None:
+    environment = os.environ.copy()
+    environment["BOONDOCK_DATA_ROOT"] = str(DATA_ROOT)
+    try:
+        completed = subprocess.run([sys.executable, "manage.py", "upgrade"], cwd=api_root(),
+                                   env=environment, capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("API migration timed out; restoring the previous installation") from exc
+    if completed.returncode:
+        raise RuntimeError("API migration failed; restoring the previous installation")
+
+
+def install_release(component: str, tag: str) -> dict:
+    # All URLs and expected checksums are resolved by the server, never the client.
+    with _installation_lock():
+        data, repository = _release_download(component, tag)
+        return _apply_component(data, component, tag, repository)
+
+
+def _apply_component(data: bytes, component: str, tag: str, repository: str) -> dict:
+    if component not in ("api", "dashboard"):
+        raise ValueError("Unknown component")
+    with tempfile.TemporaryDirectory(prefix="bd_release_") as temporary:
+        extract = Path(temporary)
+        _safe_extract_tar(data, extract)
+        if set(path.name for path in extract.iterdir()) != {component}:
+            raise ValueError("Release must contain only the selected component directory")
+        source = extract / component
+        info = read_build_info(source, component)
+        if info["repository"] != repository:
+            raise ValueError("Build repository does not match the configured repository")
+        if tag == "latest":
+            if not info["git_tag"].startswith("v"):
+                raise ValueError("latest must contain a numbered release build")
+            _validate_tag(info["git_tag"])
+        elif info["git_tag"] != tag:
+            raise ValueError("Build tag does not match the selected release")
+        if info["git_tag"].startswith("v") and parse_version(info["git_tag"]) != parse_version(info["version"]):
+            raise ValueError("Build version does not match its numbered tag")
+        if component == "api":
+            for name in API_FILES:
+                path = source / name
+                valid = path.is_dir() if name in ("app", "migrations") else path.is_file()
+                if not valid:
+                    raise ValueError(f"Required API path missing: {name}")
+        elif not (source / "index.html").is_file():
+            raise ValueError("Dashboard release must contain index.html")
+        identifier = uuid.uuid4().hex
+        entry = _snapshot(component, identifier)
+        # Persist rollback metadata before touching live files, for recovery after interruption.
+        _record_backup(entry)
         try:
-            lines = _apply_manifest(extract, manifest, br)
+            if component == "api":
+                for name in API_FILES:
+                    _copy(source / name, api_root() / name)
+                _run_upgrade()
+            else:
+                _copy(source, api_root() / "build")
+                update_component(DATA_ROOT, component, info)
         except Exception:
-            log.exception("Release apply failed, restoring pre-update snapshot")
-            snap = backups_dir() / pre_snap_id / "snapshot"
-            if snap.is_dir():
-                _restore_snapshot(snap, br)
-            st_r = _load_state()
-            st_r["backups"] = [b for b in st_r.get("backups", []) if b.get("id") != pre_snap_id]
-            _save_state(st_r)
-            if (backups_dir() / pre_snap_id).is_dir():
-                shutil.rmtree(backups_dir() / pre_snap_id, ignore_errors=True)
+            _restore(entry)
             raise
-
-        pip_result = None
-        if install_dependencies:
-            pip_result = _run_pip_if_requested(br)
-
-        st = _load_state()
-        st["current"] = {
-            "version": version,
-            "build_id": build_id,
-            "applied_at": _utc_now(),
-            "backup_id": pre_snap_id,
-        }
-        _save_state(st)
-        _prune_backups()
-
-        return {
-            "ok": True,
-            "version": version,
-            "build_id": build_id,
-            "message": "Release applied. Restart the Boondock Edge service for all changes to take effect.",
-            "log": lines,
-            "pre_update_backup_id": pre_snap_id,
-            "pip_install": pip_result,
-        }
+        return {"ok": True, "component": component, "installed": info,
+                "pre_update_backup_id": identifier,
+                "message": "Installed. Restart the API service to load updated code."}
 
 
-def _new_backup_suffix() -> str:
-    return uuid.uuid4().hex[:10]
-
-
-def rollback(backup_id: str) -> dict[str, Any]:
-    if not backup_id or len(backup_id) > 120:
+def rollback(backup_id: str) -> dict:
+    if not isinstance(backup_id, str) or not re.fullmatch(r"[0-9a-f]{32}", backup_id):
         raise ValueError("Invalid backup id")
-    if not re.fullmatch(r"[a-zA-Z0-9._-]+", backup_id):
-        raise ValueError("Invalid backup id")
-    bid = backup_id
-    if ".." in bid or Path(bid).is_absolute():
-        raise ValueError("Invalid backup id")
-    root = backups_dir() / bid / "snapshot"
-    if not root.is_dir():
-        raise ValueError("Backup not found")
-    br = api_root()
-    st = _load_state()
-    re_snap_id = f"rollback-{_new_backup_suffix()}"
-    re_snap = _create_snapshot(re_snap_id, br)
-    shutil.move(str(re_snap), str(backups_dir() / re_snap_id / "snapshot"))
-    st["backups"] = [
-        {
-            "id": re_snap_id,
-            "type": "pre_rollback",
-            "label": f"State before rollback to {bid}",
-            "created_at": _utc_now(),
-        },
-        *st.get("backups", []),
-    ][:20]
-    _save_state(st)
-    try:
-        _restore_snapshot(root, br)
-    except Exception:
-        re_path = backups_dir() / re_snap_id / "snapshot"
-        if re_path.is_dir():
-            _restore_snapshot(re_path, br)
-        st2 = _load_state()
-        st2["backups"] = [b for b in st2.get("backups", []) if b.get("id") != re_snap_id]
-        _save_state(st2)
-        if (backups_dir() / re_snap_id).is_dir():
-            shutil.rmtree(backups_dir() / re_snap_id, ignore_errors=True)
-        raise
-
-    st2 = _load_state()
-    st2["current"] = {
-        "version": f"restored from backup {bid}",
-        "build_id": bid,
-        "applied_at": _utc_now(),
-    }
-    _save_state(st2)
-    return {
-        "ok": True,
-        "message": f"Rolled back to backup {bid}. Restart the Boondock Edge service to load the restored code.",
-    }
+    with _installation_lock():
+        entry = next((item for item in _load_state()["backups"] if item["id"] == backup_id), None)
+        if entry is None:
+            raise ValueError("Backup not found")
+        recovery = _snapshot(entry["component"], uuid.uuid4().hex)
+        # Keep the requested snapshot until it has been restored.
+        try:
+            _restore(entry)
+            _record_backup(recovery)
+        except Exception:
+            _restore(recovery)
+            raise
+        return {"ok": True, "component": entry["component"],
+                "message": "Backup restored. Restart the API service to load restored code."}
