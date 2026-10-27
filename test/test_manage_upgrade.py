@@ -4,7 +4,6 @@ import sqlite3
 import pytest
 
 import manage
-from test.test_release_metadata import build_info
 
 
 @pytest.fixture
@@ -13,7 +12,15 @@ def installation(monkeypatch, tmp_path):
     code = tmp_path / "api"
     data.mkdir()
     code.mkdir()
-    info = build_info(version="2.0.0-beta.10")
+    info = {
+        "component": "api",
+        "version": "2.0.0-beta.10",
+        "display_name": "Edge api 2.0.0-beta.10",
+        "git_tag": "beta",
+        "git_commit": "b" * 40,
+        "built_at": "2026-10-26T12:00:00Z",
+        "repository": "example/api",
+    }
     (code / "build-info.json").write_text(json.dumps(info))
     monkeypatch.setattr(manage, "DATA_ROOT", data)
     monkeypatch.setattr(manage, "CODE_ROOT", code)

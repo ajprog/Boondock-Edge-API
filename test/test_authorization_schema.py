@@ -26,9 +26,6 @@ def test_new_install_creates_complete_authorization_schema(monkeypatch, tmp_path
         row[1] for row in connection.execute("PRAGMA table_info(api_keys)")
     }
     group_id_column = connection.execute("PRAGMA table_info(groups)").fetchone()
-    migration_count = connection.execute(
-        "SELECT COUNT(*) FROM schema_migrations"
-    ).fetchone()[0]
     connection.close()
     settings_module.SettingsManager._instance = None
 
@@ -46,7 +43,7 @@ def test_new_install_creates_complete_authorization_schema(monkeypatch, tmp_path
         "created_by",
     }
     assert group_id_column[1:3] == ("id", "INTEGER")
-    assert migration_count == 1
+    assert "schema_migrations" not in tables
 
 
 def test_new_channel_receives_default_group_owner(monkeypatch, tmp_path):

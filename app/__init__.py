@@ -175,23 +175,24 @@ def create_app(config_class=Config):
         app.logger.warning(f"Settings database init check on startup: {e}")
 
     # Provision default hotspot on first boot when Wi-Fi AP mode is supported.
-    try:
-        import threading
+    if not _reloader_active or _werkzeug_main == 'true':
+        try:
+            import threading
 
-        def _hotspot_setup_worker():
-            try:
-                from app.services.hotspot_setup import run_initial_hotspot_setup
+            def _hotspot_setup_worker():
+                try:
+                    from app.services.hotspot_setup import run_initial_hotspot_setup
 
-                outcome = run_initial_hotspot_setup()
-                if outcome.get("success"):
-                    app.logger.info("Initial hotspot setup completed: %s", outcome)
-                elif not outcome.get("skipped"):
-                    app.logger.warning("Initial hotspot setup did not succeed: %s", outcome)
-            except Exception as setup_exc:
-                app.logger.warning("Initial hotspot setup error: %s", setup_exc)
+                    outcome = run_initial_hotspot_setup()
+                    if outcome.get("success"):
+                        app.logger.info("Initial hotspot setup completed: %s", outcome)
+                    elif not outcome.get("skipped"):
+                        app.logger.warning("Initial hotspot setup did not succeed: %s", outcome)
+                except Exception as setup_exc:
+                    app.logger.warning("Initial hotspot setup error: %s", setup_exc)
 
-        threading.Thread(target=_hotspot_setup_worker, daemon=True).start()
-    except Exception as e:
-        app.logger.warning(f"Could not schedule hotspot setup: {e}")
+            threading.Thread(target=_hotspot_setup_worker, daemon=True).start()
+        except Exception as e:
+            app.logger.warning(f"Could not schedule hotspot setup: {e}")
 
     return app
