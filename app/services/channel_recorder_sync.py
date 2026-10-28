@@ -83,12 +83,8 @@ def _flatten_config(config, prefix=''):
             flattened.update(_flatten_config(value, path))
     return flattened
 
-def import_recorder_configuration(channel, recorder, config):
-    """Persist supported values from an Echo/Tango EXPORT document."""
-    if not isinstance(config, dict):
-        raise ValueError('Recorder returned an invalid configuration')
-    with _config_lock:
-        _exported_configs[recorder['port']] = deepcopy(config)
+def channel_from_device_configuration(channel, config):
+    """Merge supported firmware fields into a channel without device I/O."""
     exported = _flatten_config(config)
     updated = dict(channel)
     for field, candidates in _EXPORT_TO_CHANNEL.items():
@@ -99,6 +95,28 @@ def import_recorder_configuration(channel, recorder, config):
                     value = str(value)
                 updated[field] = value
                 break
+    return updated
+
+
+def device_configuration_from_channel(channel):
+    """Return the supported firmware settings stored on a channel."""
+    config = {}
+    for field, (section, setting) in _CHANNEL_TO_RECORDER.items():
+        if channel.get(field) is not None:
+            value = float(channel[field])
+            config.setdefault(section, {})[setting] = int(value) if value.is_integer() else value
+    if channel.get('device_hostname') is not None:
+        config['ho'] = channel['device_hostname']
+    if channel.get('device_ip') is not None:
+        config['cip'] = {'ip': channel['device_ip']}
+    return config
+
+
+def import_recorder_configuration(channel, recorder, config):
+    """Persist supported values from an Echo/Tango EXPORT document."""
+    updated = channel_from_device_configuration(channel, config)
+    with _config_lock:
+        _exported_configs[recorder['port']] = deepcopy(config)
     for field in ('device_hostname', 'device_ip'):
         if recorder.get(field) or recorder.get(field.removeprefix('device_')):
             updated[field] = recorder.get(field) or recorder.get(field.removeprefix('device_'))
@@ -110,16 +128,6 @@ def forget_recorder_configuration(port):
     with _config_lock:
         _exported_configs.pop(port, None)
 
-def _recorder_value(value, current):
-    """Preserve the value type used by the recorder's exported document."""
-    if isinstance(current, bool):
-        return value if isinstance(value, bool) else str(value).lower() == 'true'
-    if isinstance(current, int):
-        return int(value)
-    if isinstance(current, float):
-        return float(value)
-    return value
-
 def export_channel_configuration(channel, recorder):
     """Merge channel settings into the last export and import it atomically."""
     port = recorder['port']
@@ -129,12 +137,13 @@ def export_channel_configuration(channel, recorder):
             raise RuntimeError('Recorder configuration has not been exported')
         config = deepcopy(saved_config)
 
-    for field, (section, setting) in _CHANNEL_TO_RECORDER.items():
-        if channel.get(field) is not None:
-            section_config = config.setdefault(section, {})
-            section_config[setting] = _recorder_value(
-                channel[field], section_config.get(setting)
-            )
+    # Both transports use the same fields and numeric types. Preserve unrelated
+    # settings from EXPORT, including other keys in the audio and IP sections.
+    for key, value in device_configuration_from_channel(channel).items():
+        if isinstance(value, dict):
+            config.setdefault(key, {}).update(value)
+        else:
+            config[key] = value
 
     payload = json.dumps(config, separators=(',', ':'), ensure_ascii=True)
     success, _response = send_command_and_wait_response(

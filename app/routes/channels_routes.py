@@ -183,7 +183,7 @@ def update_channel(channel_id, channel):
         ('threshold', data.get('threshold'), lambda x: 0 <= float(x) <= 100, "Threshold must be between 0 and 100."),
         ('silence', data.get('silence'), lambda x: 500 <= float(x) <= 5000, "Silence must be between 500 and 5000 milliseconds."),
         ('min_rec', data.get('min_rec'), lambda x: 1000 <= float(x) <= 5000, "Min recording time must be between 1000 and 5000 milliseconds."),
-        ('max_rec', data.get('max_rec'), lambda x: 10000 <= float(x) <= 30000, "Max recording time must be between 10000 and 30000 milliseconds."),
+        ('max_rec', data.get('max_rec'), lambda x: 10000 <= float(x) <= 180000, "Max recording time must be between 10000 and 180000 milliseconds."),
         ('audio_gain', data.get('audio_gain'),
             lambda x: float(x) in (-3, 0, 3, 6, 9, 12, 15, 18, 21, 24),
             "Audio gain must be one of: -3, 0, 3, 6, 9, 12, 15, 18, 21, 24 dB.")
@@ -234,6 +234,8 @@ def update_channel(channel_id, channel):
         if field in data:
             channel[field] = data[field]
 
+    # Every user save needs delivery unless the USB recorder confirms it.
+    channel['synced'] = False
     try:
         saved_id = _settings_manager.save_channel(channel)
         if saved_id == -1:
@@ -247,6 +249,7 @@ def update_channel(channel_id, channel):
     if recorder is not None:
         try:
             export_channel_configuration(channel, recorder)
+            _settings_manager.mark_channel_synced(channel)
             device_sync['success'] = True
         except Exception as exc:
             logging.exception('Channel %s saved, but recorder synchronization failed', channel_id)

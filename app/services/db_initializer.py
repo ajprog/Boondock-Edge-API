@@ -107,7 +107,8 @@ def _create_database_schema():
                 speaker_enabled BOOLEAN DEFAULT FALSE,
                 speaker_volume INTEGER,
                 device_hostname TEXT,
-                device_ip TEXT
+                device_ip TEXT,
+                synced BOOLEAN NOT NULL DEFAULT FALSE
             )
         ''')
 

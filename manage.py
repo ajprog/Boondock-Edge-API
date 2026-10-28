@@ -236,6 +236,7 @@ def upgrade() -> None:
     """Apply every migration after the installed version, then commit metadata."""
     from migrations.authorization import upgrade_authorization_schema
     from migrations.dashboard_cutover import upgrade_dashboard_schema
+    from migrations.channel_settings_sync import upgrade_channel_settings_schema
 
     build_info = read_build_info(CODE_ROOT)
     with manifest_lock(DATA_ROOT):
@@ -253,6 +254,7 @@ def upgrade() -> None:
             upgrade_dashboard_schema(
                 Config.get_settings_db_path(), Config.get_recordings_db_path(),
             )
+            upgrade_channel_settings_schema(Config.get_settings_db_path())
 
         # Add future migrations here with independent version checks, in order.
 

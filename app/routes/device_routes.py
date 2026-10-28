@@ -3,6 +3,7 @@ Device v1 API routes.
 Handles device events, audio uploads to S3, log uploads, channel retrieval, and device settings.
 """
 import json
+import math
 import os
 import re
 import logging
@@ -57,7 +58,11 @@ from ..routes.route_utils import (
     calculate_wav_duration,
     allowed_file,
 )
-from ..services.settings_manager import normalize_mac_address
+from ..services.settings_manager import get_settings_manager, normalize_mac_address
+from ..services.channel_recorder_sync import (
+    channel_from_device_configuration,
+    device_configuration_from_channel,
+)
 from ..services.device_health_monitor import (
     track_device_created,
     track_connection,
@@ -72,10 +77,6 @@ from ..services.cloud_device_events import (
 )
 
 device_bp = Blueprint('device', __name__)
-
-# Directory for device settings storage
-DEVICE_SETTINGS_DIR = str(DATA_ROOT / 'device_settings')
-os.makedirs(DEVICE_SETTINGS_DIR, exist_ok=True)
 
 def _device_logs_root(mac_key: str) -> str:
     return DATA_ROOT / "logs" / mac_key.lower()
@@ -222,6 +223,14 @@ def post_v1_events():
         if new_token:
             body["token"] = new_token
             body["expires_at"] = expires_at
+        # Never disclose or consume pending configuration for an unverified MAC.
+        if token_valid:
+            try:
+                settings = get_settings_manager().take_unsynced_device_settings(mac_key)
+                if settings is not None:
+                    body['settings'] = settings
+            except Exception:
+                logging.exception('Pending device settings delivery failed for %s', mac_key)
         return jsonify(body), 200
     except Exception:
         logging.exception('device lifecycle event')
@@ -1166,13 +1175,15 @@ def upload_logs(channel):
     
     return jsonify(response), 200
 
-@device_bp.route('/v1/settings', methods=['POST'])
+@device_bp.route('/device/settings', methods=['POST'], strict_slashes=False)
+@device_bp.route('/v1/settings', methods=['POST'], strict_slashes=False)
 @require_permission(
     ['device', 'channel.update'], loader=load_request_channel, inject_as='channel'
 )
 @swag_from({
     'tags': ['Settings'],
-    'summary': 'Save device settings for Boondock devices',
+    'summary': 'Update the channel from reported device settings',
+    'description': 'Stores supported firmware audio, hostname, and IP fields on the authenticated channel. Other firmware fields are ignored.',
     'security': [{'BearerAuth': []}],
     'consumes': ['multipart/form-data'],
     'parameters': [
@@ -1216,11 +1227,13 @@ def upload_logs(channel):
     }
 })
 def save_device_settings(channel):
-    """Save device settings for Boondock devices."""
+    """Store reported firmware settings on the associated channel."""
     if 'mac_address' not in request.form or 'settings' not in request.form:
         return jsonify({'error': 'Missing required fields (mac_address and settings)'}), 400
 
     mac_address = channel['mac']
+    if normalize_mac_address(request.form['mac_address']) != normalize_mac_address(mac_address):
+        return jsonify({'error': 'MAC address does not match the authenticated channel'}), 403
     settings_str = request.form['settings']
 
     try:
@@ -1228,15 +1241,31 @@ def save_device_settings(channel):
     except json.JSONDecodeError:
         return jsonify({'error': 'Invalid JSON format for settings'}), 400
 
-    filepath = os.path.join(DEVICE_SETTINGS_DIR, f"{mac_address}.json")
+    if not isinstance(settings, dict):
+        return jsonify({'error': 'Settings must be a JSON object'}), 400
+    for section in ('a', 'cip'):
+        if section in settings and not isinstance(settings[section], dict):
+            return jsonify({'error': f'Settings {section} must be a JSON object'}), 400
+    updated = channel_from_device_configuration(channel, settings)
+    for field in ('threshold', 'silence', 'min_rec', 'max_rec', 'audio_gain'):
+        if updated.get(field) != channel.get(field):
+            try:
+                if not math.isfinite(float(updated[field])):
+                    raise ValueError('non-finite number')
+            except (TypeError, ValueError, OverflowError):
+                return jsonify({'error': f'Invalid numeric setting for {field}'}), 400
+    for field in ('device_hostname', 'device_ip'):
+        if updated.get(field) is not None and not isinstance(updated[field], str):
+            return jsonify({'error': f'Invalid string setting for {field}'}), 400
+
     try:
-        with open(filepath, 'w') as f:
-            json.dump(settings, f, indent=2)
+        if get_settings_manager().save_channel(updated) == -1:
+            raise RuntimeError('Channel database update failed')
     except Exception as e:
         return jsonify({'error': f'Failed to save settings: {str(e)}'}), 500
 
     utc_now = datetime.now(timezone.utc)
-    log_message = f"Settings saved - Device: {mac_address}, Filepath: {filepath}"
+    log_message = f"Settings saved to channel {channel['id']} - Device: {mac_address}"
     logging.info(log_message)
 
     response = {
@@ -1247,7 +1276,8 @@ def save_device_settings(channel):
     return jsonify(response), 200
 
 
-@device_bp.route('/v1/settings/<mac>', methods=['GET'])
+@device_bp.route('/device/settings/<mac>', methods=['GET'], strict_slashes=False)
+@device_bp.route('/v1/settings/<mac>', methods=['GET'], strict_slashes=False)
 @require_permission(
     ['device', 'channel.read'],
     loader=load_request_channel,
@@ -1256,7 +1286,8 @@ def save_device_settings(channel):
 )
 @swag_from({
     'tags': ['Settings'],
-    'summary': 'Retrieve device settings for Boondock devices',
+    'summary': 'Retrieve firmware settings from the associated channel',
+    'description': 'Returns supported audio, hostname, and IP settings in firmware schema. Firmware/config versions and other unsupported fields are omitted.',
     'security': [{'BearerAuth': []}],
     'parameters': [
         {
@@ -1282,24 +1313,22 @@ def save_device_settings(channel):
                 'additionalProperties': True
             }
         },
-        '404': {'description': 'Settings not found for this device'},
+        '404': {'description': 'Channel not found for this device'},
         '500': {'description': 'Server error - Failed to read settings'}
     }
 })
 def get_device_settings(mac, channel):
-    """Retrieve device settings for Boondock devices."""
+    """Return channel-backed settings using the firmware schema."""
     mac_address = channel['mac']
-    filepath = os.path.join(DEVICE_SETTINGS_DIR, f"{mac_address}.json")
-    if not os.path.exists(filepath):
-        return jsonify({'error': 'Settings not found for this device'}), 404
+    if normalize_mac_address(mac) != normalize_mac_address(mac_address):
+        return jsonify({'error': 'MAC address does not match the authenticated channel'}), 403
 
     try:
-        with open(filepath, 'r') as f:
-            settings = json.load(f)
+        settings = device_configuration_from_channel(channel)
     except Exception as e:
         return jsonify({'error': f'Failed to read settings: {str(e)}'}), 500
 
-    log_message = f"Settings retrieved - Device: {mac_address}, Filepath: {filepath}"
+    log_message = f"Settings retrieved from channel {channel['id']} - Device: {mac_address}"
     logging.info(log_message)
 
     return jsonify(settings), 200

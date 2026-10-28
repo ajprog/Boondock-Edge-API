@@ -208,10 +208,36 @@ overwrite operational data. The data root may contain:
 db/                 SQLite settings, recordings metadata, logs, and secret key
 recordings/         Received and processed audio
 logs/               Application and device logs
-device_settings/    Per-device configuration
 dashboard/          Optional dashboard build
 docs/               Downloadable documentation files
 ```
+
+Device settings reported to `POST /api/device/settings` update the channel selected
+by `mac_address` in SQLite. The legacy form fields (`mac_address` and a JSON
+string named `settings`) remain supported. `GET /api/device/settings/<mac>` reads
+that channel and returns supported settings in the firmware schema: `a.ath`,
+`a.stm`, `a.mrm`, `a.xrm`, `a.cg`, `ho`, and `cip.ip`. Other firmware fields are
+not stored by this endpoint. Device reports do not initiate an outbound sync.
+Legacy `device_settings/<MAC>.json` files are no longer read or written.
+The `/api/v1/settings` POST and `/api/v1/settings/<mac>` GET routes remain
+aliases during migration. Both route families accept a trailing slash.
+
+Channels persist a `synced` boolean (initially false). A user channel save sets
+it to false; a successful USB sync sets it to true. On an authenticated
+`POST /api/v1/events`, a false flag includes the channel's firmware `settings`
+object in the successful response and sets the flag to true. Later events omit
+`settings` until another user save. Payloads over 4096 serialized bytes remain
+pending. Device settings reports preserve the flag. Event delivery tracks one
+response attempt, not acknowledgment that the device applied the settings.
+Clean installs define `synced` in the channel schema. Existing installations
+must run `python -m migrations.channel_settings_sync` from the API repository
+before starting the updated API. This standalone migration adds the column
+without requiring changes to `manage.py`.
+
+USB writes and Wi-Fi responses share the same outbound mapping and numeric
+types. USB merges those fields into its last full device export; Wi-Fi returns
+only the supported fields. Speaker and audio-stream settings are currently
+stored on the channel but have no outbound firmware mapping in either path.
 
 Back up the entire data root while writes are stopped, or use the application's
 configured S3/network-drive backup features. Protect backups as sensitive data:

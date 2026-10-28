@@ -41,6 +41,7 @@ def test_channel_update_accepts_documented_threshold_range(channel_api):
 
     assert response.status_code == 200
     assert manager.get_channel(channel_id)["threshold"] == "50"
+    assert manager.get_channel(channel_id)["synced"] is False
 
 
 def test_channel_update_rejects_threshold_outside_documented_range(channel_api):
@@ -110,6 +111,43 @@ def test_channel_patch_keeps_database_update_when_device_sync_fails(
         "error": "Recorder did not confirm configuration",
     }
     assert manager.get_channel(channel_id)["threshold"] == "55"
+    assert manager.get_channel(channel_id)["synced"] is False
+
+
+def test_successful_usb_sync_persists_synced_flag(channel_api, monkeypatch):
+    client, manager, channel_id, headers = channel_api
+    from app.routes import channels_routes
+
+    monkeypatch.setattr(channels_routes, 'find_connected_recorder', lambda _mac: {'port': '/dev/ttyUSB0'})
+    monkeypatch.setattr(channels_routes, 'export_channel_configuration', lambda *_args: None)
+    response = client.patch(f'/api/channels/{channel_id}', json={'threshold': '35'}, headers=headers)
+
+    assert response.status_code == 200
+    assert response.json['device_sync']['success'] is True
+    assert response.json['channel']['synced'] is True
+    assert manager.get_channel(channel_id)['synced'] is True
+    assert client.get(f'/api/channels/{channel_id}', headers=headers).json['synced'] is True
+
+    monkeypatch.setattr(channels_routes, 'find_connected_recorder', lambda _mac: None)
+    response = client.patch(f'/api/channels/{channel_id}', json={'threshold': '40'}, headers=headers)
+    assert response.json['channel']['synced'] is False
+
+
+def test_usb_confirmation_does_not_clear_newer_edit(channel_api, monkeypatch):
+    client, manager, channel_id, headers = channel_api
+    from app.routes import channels_routes
+
+    monkeypatch.setattr(channels_routes, 'find_connected_recorder', lambda _mac: {'port': '/dev/ttyUSB0'})
+
+    def newer_edit(*_args):
+        channel = manager.get_channel(channel_id)
+        channel.update(threshold='55', synced=False)
+        manager.save_channel(channel)
+
+    monkeypatch.setattr(channels_routes, 'export_channel_configuration', newer_edit)
+    response = client.patch(f'/api/channels/{channel_id}', json={'threshold': '35'}, headers=headers)
+    assert response.json['channel']['threshold'] == '55'
+    assert response.json['channel']['synced'] is False
 
 
 def test_legacy_singular_channel_update_route_is_removed(channel_api):

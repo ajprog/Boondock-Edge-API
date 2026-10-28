@@ -86,6 +86,43 @@ def test_channel_import_requires_initial_export(monkeypatch):
         raise AssertionError("missing export should fail")
 
 
+def test_usb_and_wifi_use_identical_supported_fields_and_types(monkeypatch):
+    from app.services import channel_recorder_sync as sync
+
+    port = '/dev/ttyUSB-mapping-test'
+    commands = []
+    monkeypatch.setattr(sync._settings_manager, 'save_channel', lambda channel: channel['id'])
+    monkeypatch.setattr(sync, 'send_command_and_wait_response',
+                        lambda _port, command, **_kwargs: (commands.append(command) or True, {}))
+    initial = {
+        'a': {'ath': '10', 'cg': '0', 'prm': 500},
+        'ho': 'old.local', 'cip': {'ip': '192.168.1.2', 'en': True},
+        'w': [{'ss': 'keep-network'}],
+    }
+    sync.import_recorder_configuration({'id': 7, 'mac': 'AABBCCDDEEFF'}, {'port': port}, initial)
+    channel = {
+        'threshold': '35', 'silence': '1500', 'min_rec': '1000',
+        'max_rec': '25000', 'audio_gain': '3',
+        'device_hostname': 'new.local', 'device_ip': '192.168.1.3',
+    }
+    sync.export_channel_configuration(channel, {'port': port})
+    usb_config = json.loads(commands[0].removeprefix('IMPORT '))
+    wifi_config = sync.device_configuration_from_channel(channel)
+    for key, value in wifi_config.items():
+        if isinstance(value, dict):
+            for nested_key, nested_value in value.items():
+                assert usb_config[key][nested_key] == nested_value
+                assert type(usb_config[key][nested_key]) is type(nested_value)
+        else:
+            assert usb_config[key] == value
+    assert usb_config['a']['prm'] == 500
+    assert usb_config['cip']['en'] is True
+    assert usb_config['w'] == initial['w']
+    assert usb_config['ho'] == 'new.local'
+    assert usb_config['cip']['ip'] == '192.168.1.3'
+    sync.forget_recorder_configuration(port)
+
+
 def test_monitor_requests_and_applies_one_initial_export(monkeypatch):
     from app.services import channel_recorder_sync, recorder_monitor
 

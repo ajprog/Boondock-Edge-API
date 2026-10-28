@@ -905,7 +905,7 @@ class SettingsManager:
                         threshold=?, silence=?, min_rec=?, max_rec=?, audio_gain=?,
                         frequency=?, tone=?, type=?, deleted=?, audio_stream_port=?,
                         speaker_enabled=?, speaker_volume=?, device_hostname=?,
-                        device_ip=? WHERE id=?
+                        device_ip=?, synced=? WHERE id=?
                     ''', (
                         channel_data.get('name'),
                         channel_data.get('status'),
@@ -935,6 +935,7 @@ class SettingsManager:
                         channel_data.get('speaker_volume'),
                         channel_data.get('device_hostname'),
                         channel_data.get('device_ip'),
+                        channel_data.get('synced', False),
                         channel_data['id']
                     ))
                     conn.commit()
@@ -957,8 +958,8 @@ class SettingsManager:
                             color, background_color, team_color, car, driver, person, tag, mac,
                             audio_stream_enabled, threshold, silence, min_rec, max_rec, audio_gain,
                             frequency, tone, type, deleted, audio_stream_port, speaker_enabled,
-                            speaker_volume, device_hostname, device_ip)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            speaker_volume, device_hostname, device_ip, synced)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ''', (
                             channel_data.get('name'),
                             channel_data.get('status'),
@@ -987,7 +988,8 @@ class SettingsManager:
                             channel_data.get('speaker_enabled', 0),
                             channel_data.get('speaker_volume'),
                             channel_data.get('device_hostname'),
-                            channel_data.get('device_ip')
+                            channel_data.get('device_ip'),
+                            channel_data.get('synced', False)
                         ))
                         lastrowid = cursor.lastrowid
                         default_group = cursor.execute(
@@ -1023,6 +1025,52 @@ class SettingsManager:
             finally:
                 conn.close()
     
+    def mark_channel_synced(self, channel: Dict[str, Any]) -> bool:
+        """Mark the USB snapshot synced only if its settings still match."""
+        fields = ('mac', 'threshold', 'silence', 'min_rec', 'max_rec',
+                  'audio_gain', 'device_hostname', 'device_ip')
+        predicate = ' AND '.join(f'{field} IS ?' for field in fields)
+        with _db_lock:
+            conn = self._get_connection()
+            try:
+                cursor = conn.execute(
+                    f'UPDATE channels SET synced = 1 WHERE id = ? AND deleted = 0 AND {predicate}',
+                    [channel['id'], *(channel.get(field) for field in fields)],
+                )
+                conn.commit()
+                return cursor.rowcount == 1
+            finally:
+                conn.close()
+
+    def take_unsynced_device_settings(self, mac: str) -> Optional[Dict[str, Any]]:
+        """Claim one settings delivery atomically, leaving invalid payloads pending."""
+        from .channel_recorder_sync import device_configuration_from_channel
+
+        with _db_lock:
+            conn = self._get_connection()
+            try:
+                conn.execute('BEGIN IMMEDIATE')
+                row = conn.execute(
+                    'SELECT * FROM channels WHERE mac = ? AND deleted = 0 AND synced = 0',
+                    (normalize_mac_address(mac),),
+                ).fetchone()
+                if row is None:
+                    conn.commit()
+                    return None
+                settings = device_configuration_from_channel(dict(row))
+                # Match Flask's default escaping and spacing; reject NaN/Infinity.
+                payload = json.dumps(settings, ensure_ascii=True, allow_nan=False)
+                if len(payload.encode('utf-8')) > 4096:
+                    raise ValueError('Device settings exceed 4096 bytes')
+                conn.execute('UPDATE channels SET synced = 1 WHERE id = ?', (row['id'],))
+                conn.commit()
+                return settings
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def delete_channel(self, channel_id: int) -> bool:
         """Delete a channel (soft delete by setting deleted flag)."""
         with _db_lock:

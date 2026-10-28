@@ -2,8 +2,39 @@
 
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from app.services import db_initializer, settings_manager
 from app.utils.sqlite_utils import connect_sqlite
+
+
+def test_synced_column_upgrade_preserves_existing_channels(monkeypatch, tmp_path):
+    from migrations.channel_settings_sync import upgrade_channel_settings_schema
+
+    database = tmp_path / 'old-settings.db'
+    monkeypatch.setattr(db_initializer.Config, 'get_settings_db_path', lambda: database)
+    db_initializer._create_database_schema()
+    with sqlite3.connect(database) as connection:
+        fresh_columns = connection.execute('PRAGMA table_info(channels)').fetchall()
+        connection.execute('ALTER TABLE channels DROP COLUMN synced')
+        connection.execute("INSERT INTO channels (mac, threshold) VALUES ('AABBCCDDEEFF', '35')")
+    db_initializer._create_database_schema()
+    with sqlite3.connect(database) as connection:
+        assert 'synced' not in {row[1] for row in connection.execute('PRAGMA table_info(channels)')}
+    upgrade_channel_settings_schema(database)
+    upgrade_channel_settings_schema(database)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute('PRAGMA table_info(channels)').fetchall() == fresh_columns
+        assert connection.execute('SELECT threshold, synced FROM channels').fetchone() == ('35', 0)
+        connection.execute('UPDATE channels SET synced=1')
+    upgrade_channel_settings_schema(database)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute('SELECT synced FROM channels').fetchone() == (1,)
+    # The standalone command works without any manage.py integration.
+    import runpy
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / 'migrations' / 'channel_settings_sync.py'),
+                  run_name='__main__')
+    with sqlite3.connect(database) as connection:
+        assert connection.execute('SELECT synced FROM channels').fetchone() == (1,)
 
 
 def test_new_settings_database_can_store_datetime(monkeypatch, tmp_path):
