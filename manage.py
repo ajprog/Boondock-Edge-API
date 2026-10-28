@@ -254,7 +254,10 @@ def upgrade() -> None:
             upgrade_dashboard_schema(
                 Config.get_settings_db_path(), Config.get_recordings_db_path(),
             )
-            upgrade_channel_settings_schema(Config.get_settings_db_path())
+
+        # Schema-based and safe to retry, including for versioned installations.
+        # No release version has yet been assigned to channel delivery tracking.
+        upgrade_channel_settings_schema(Config.get_settings_db_path())
 
         # Add future migrations here with independent version checks, in order.
 

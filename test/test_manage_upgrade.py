@@ -24,6 +24,14 @@ def installation(monkeypatch, tmp_path):
     (code / "build-info.json").write_text(json.dumps(info))
     monkeypatch.setattr(manage, "DATA_ROOT", data)
     monkeypatch.setattr(manage, "CODE_ROOT", code)
+    settings = data / 'settings.db'
+    monkeypatch.setattr(manage.Config, 'get_settings_db_path', lambda: settings)
+    monkeypatch.setattr(manage.Config, 'get_recordings_db_path', lambda: data / 'recordings.db')
+    from app.services import db_initializer
+    db_initializer._create_database_schema()
+    with sqlite3.connect(settings) as database:
+        database.execute('ALTER TABLE channels DROP COLUMN synced')
+        database.execute("INSERT INTO channels (mac, threshold) VALUES ('AABBCCDDEEFF', '35')")
     return data, code, info
 
 
@@ -39,6 +47,8 @@ def test_missing_version_runs_all_migrations(monkeypatch, installation, manifest
                         lambda settings, recordings: called.append("dashboard"))
     manage.upgrade()
     assert called == ["authorization", "dashboard"]
+    with sqlite3.connect(data / 'settings.db') as database:
+        assert database.execute('SELECT threshold, synced FROM channels').fetchone() == ('35', 0)
     assert json.loads((data / "manifest.json").read_text()) == {**(manifest or {}), "api": info}
 
 
@@ -55,6 +65,27 @@ def test_installed_version_skips_pre_manifest_migrations(monkeypatch, installati
     monkeypatch.setattr("migrations.dashboard_cutover.upgrade_dashboard_schema", unexpected)
     manage.upgrade()
     assert json.loads((data / "manifest.json").read_text()) == {**original, "api": info}
+    with sqlite3.connect(data / 'settings.db') as database:
+        assert database.execute('SELECT threshold, synced FROM channels').fetchone() == ('35', 0)
+        database.execute('UPDATE channels SET synced=1')
+    manage.upgrade()
+    with sqlite3.connect(data / 'settings.db') as database:
+        assert database.execute('SELECT synced FROM channels').fetchone() == (1,)
+
+
+def test_channel_migration_failure_preserves_versioned_manifest(monkeypatch, installation):
+    data, _, _ = installation
+    path = data / 'manifest.json'
+    original = '{ "api": {"version": "2.0.0-beta.9"}, "dashboard": {"custom": 42} }\n'
+    path.write_text(original)
+
+    def fail(*_args):
+        raise RuntimeError('Channel migration failed')
+
+    monkeypatch.setattr('migrations.channel_settings_sync.upgrade_channel_settings_schema', fail)
+    with pytest.raises(RuntimeError, match='Channel migration failed'):
+        manage.upgrade()
+    assert path.read_text() == original
 
 
 def test_failure_preserves_manifest_bytes(monkeypatch, installation):
